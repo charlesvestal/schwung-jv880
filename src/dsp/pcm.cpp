@@ -961,6 +961,98 @@ void Pcm::PCM_Update(uint64_t cycles)
             int active = okey && key;
             int kon = key && !okey;
 
+            // This slot's contribution to the L/R/reverb/chorus mix. The
+            // reverb/chorus injection + accumulation tail below runs for every
+            // slot regardless, so these are declared up front and the fast path
+            // sets them to zero (an idle slot contributes silence).
+            int sampl, sampr, rc0, rc1;
+
+            // -----------------------------------------------------------------
+            // Fast path: skip the full voice pipeline for fully-idle slots.
+            //
+            // Predicate: key == 0  (the slot's voice_active bit is clear).
+            //
+            // Observable-state analysis (why key==0 is provably equivalent to
+            // running the full pipeline for an idle slot):
+            //
+            //   active = okey && key  and  kon = key && !okey. With key==0 we
+            //   have active==0 and kon==0, so the full path takes exactly the
+            //   "inactive" branches everywhere. Tracing every persisted write
+            //   the full path performs in that case:
+            //
+            //   * ram1[4] (wave address): line ~1146 is gated by `active`, so
+            //     the address is NOT advanced for an inactive slot. The fast
+            //     path leaves it unchanged -> identical, and firmware reads it
+            //     back unchanged either way.
+            //   * ram1[1], ram1[3], ram1[5]: the inactive block (~1342-1344)
+            //     forces these to 0 when nfs. Fast path writes 0 likewise.
+            //   * ram2[8]: every write to it in the full path is overwritten by
+            //     `ram2[8] = 0` in the inactive block (~1347). -> 0.
+            //   * ram2[9], ram2[10]: calc_tv(0/1, active=0) writes them but the
+            //     inactive block immediately zeroes them (~1348-1349). -> 0.
+            //   * ram2[11]: calc_tv(2, ram2[5], &ram2[11], active=0) writes it
+            //     and it is NOT zeroed afterwards, so it MUST be reproduced. For
+            //     e==2 && !active the `if (e != 2 || active)` guards make the
+            //     result independent of the OLD levelcur, so this single cheap
+            //     call is the only piece of the pipeline that must survive.
+            //   * ram2[7] (incl. the okey/key bit 5 and old_nibble): writes at
+            //     ~1331/1335 are gated by `key`, so with key==0 ram2[7] is never
+            //     touched. (Note: okey is only ever SET, never cleared, by the
+            //     loop; a stale okey==1 after key-off does not change any
+            //     persisted state when key==0 -- it only feeds newnibble/output,
+            //     all of which is discarded for an inactive slot.)
+            //   * IRQ (pcm.irq_assert / irq_channel / ram2[8] bit 0x4000 / GA
+            //     int): the IRQ block (~1282) is gated by `active`, so an idle
+            //     slot never generates an IRQ. Fast path generates none.
+            //   * Mix output: with active==0, pan and rc are forced to 0
+            //     (~1315-1316) so sampl=sampr=rc0=rc1=0 -- the slot contributes
+            //     silence. Fast path sets these to 0 directly. The reverb/chorus
+            //     injection switch and the suml/sumr accumulation tail still run
+            //     for this slot (they depend on slot index / pre-loop rcadd, not
+            //     on this slot's voice computation), so they are left untouched
+            //     below.
+            //   * All other ram1[0,2,6,7] / ram2[0-7,12-15]: untouched by the
+            //     full path for an idle slot, untouched here.
+            //
+            //   ram2[7] bit5 (key bit) at line ~1417 is the slot-31 special
+            //   handling outside this loop and is unaffected.
+            //
+            // Edge cases covered by the predicate:
+            //   * key-on (key==1, okey==0): kon==1, predicate false -> full path.
+            //   * key held / sustain / firmware-driven release (key==1): full
+            //     path. This emulator has no internal post-key-off release tail;
+            //     the envelope runs while the firmware holds the voice_mask bit,
+            //     then the firmware clears it (key->0) and the inactive block
+            //     resets the envelope -- exactly what the fast path reproduces.
+            //   * rapid retrigger: the step the bit is re-set takes key==1 ->
+            //     full path, so the key-on transition is never skipped.
+            // -----------------------------------------------------------------
+            if (key == 0)
+            {
+                if (pcm.nfs)
+                {
+                    ram1[1] = 0;
+                    ram1[3] = 0;
+                    ram1[5] = 0;
+                }
+
+                ram2[8] = 0;
+                ram2[9] = 0;
+                ram2[10] = 0;
+
+                // The only pipeline state that survives an idle step: the e==2
+                // envelope/filter level. With active==0 it is independent of the
+                // previous level, so this lone cheap call reproduces it exactly.
+                calc_tv(&pcm, 2, ram2[5], &ram2[11], 0, NULL);
+
+                sampl = 0;
+                sampr = 0;
+                rc0 = 0;
+                rc1 = 0;
+            }
+            else
+            {
+
             // address generator
 
             int b15 = (ram2[8] & 0x8000) != 0; // 0
@@ -1315,11 +1407,11 @@ void Pcm::PCM_Update(uint64_t cycles)
             int pan = active ? ram2[1] : 0;
             int rc = active ? ram2[2] : 0;
 
-            int sampl = multi(sample3, (pan >> 8) & 255);
-            int sampr = multi(sample3, (pan >> 0) & 255);
+            sampl = multi(sample3, (pan >> 8) & 255);
+            sampr = multi(sample3, (pan >> 0) & 255);
 
-            int rc0 = multi(sample3, (rc >> 8) & 255) >> 5; // reverb
-            int rc1 = multi(sample3, (rc >> 0) & 255) >> 5; // chorus
+            rc0 = multi(sample3, (rc >> 8) & 255) >> 5; // reverb
+            rc1 = multi(sample3, (rc >> 0) & 255) >> 5; // chorus
 
             // sampl_per_slot[slot] = sampl;
             // sampr_per_slot[slot] = sampr;
@@ -1348,8 +1440,9 @@ void Pcm::PCM_Update(uint64_t cycles)
                 ram2[9] = 0;
                 ram2[10] = 0;
             }
+            } // end heavy path (key != 0)
         // }
-            
+
         // for (int slot = 0; slot < reg_slots; slot++)
         // {
         //     int sampl = sampl_per_slot[slot];
