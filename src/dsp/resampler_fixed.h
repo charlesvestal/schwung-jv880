@@ -83,11 +83,17 @@ typedef struct {
      * over taps is contiguous.  Built at init. */
     float coeffs[RF_L][RF_TAPS_PER_PHASE];
 
-    /* History ring of the last RF_TAPS_PER_PHASE input samples per channel.
-     * Stored as a simple shifting line (small, fits in cache); index 0 is the
-     * oldest.  We keep two channels interleaved processing two pointers. */
-    float histL[RF_TAPS_PER_PHASE];
-    float histR[RF_TAPS_PER_PHASE];
+    /* History of the last RF_TAPS_PER_PHASE input samples per channel, held in
+     * a double-length mirror buffer so appending is O(1) AND every TP-sample
+     * window stays contiguous (required by the NEON dot product below).
+     *
+     * Each new sample is written to BOTH histL[pos] and histL[pos + TP].  The
+     * window of the last TP samples, oldest..newest, then lives contiguously at
+     * histL[pos + 1 .. pos + TP] (newest at the high end), with no wraparound:
+     * see ResamplerFixed_process.  This replaces the old shift-the-whole-line
+     * approach, which copied TP*2 floats on every single input sample. */
+    float histL[2 * RF_TAPS_PER_PHASE];
+    float histR[2 * RF_TAPS_PER_PHASE];
 
     /* Phase accumulator.  Conceptually: the position of the next output
      * sample, measured in input samples, advances by M/L each output.  We
@@ -98,10 +104,11 @@ typedef struct {
      * input-advance and a residual phase in [0, L).
      */
     int32_t phase;        /* current fractional phase in [0, RF_L)         */
-    /* number of valid input samples currently sitting in the history line.
-     * Until the line is primed (>= TAPS_PER_PHASE) we still produce output
-     * using zero-padded history, matching a causal FIR startup. */
-    int32_t primed;
+    /* Residue (sample index mod TP) of the most recently written sample; the
+     * next sample goes to (pos+1)%TP.  Starts at TP-1 so the first append lands
+     * at 0.  History starts zeroed, giving the same zero-padded causal FIR
+     * startup as a freshly cleared shift line. */
+    int32_t pos;
 } ResamplerFixed;
 
 /* Zeroth-order modified Bessel function I0, series form (double). */
@@ -125,7 +132,7 @@ static inline void ResamplerFixed_init(ResamplerFixed *r)
     memset(r->histL, 0, sizeof(r->histL));
     memset(r->histR, 0, sizeof(r->histR));
     r->phase = 0;
-    r->primed = 0;
+    r->pos = RF_TAPS_PER_PHASE - 1;   /* first append wraps to index 0 */
 
     const int N = RF_NUM_COEFFS;            /* total prototype length */
     const double L = (double)RF_L;
@@ -169,33 +176,13 @@ static inline void ResamplerFixed_init(ResamplerFixed *r)
     }
 }
 
-/* Number of output samples this process() call will emit, given in_frames
- * input frames and the current phase.  Useful for sizing output buffers. */
-static inline int ResamplerFixed_output_count(const ResamplerFixed *r, int in_frames)
-{
-    /* Each input sample advances the available source position by 1.0 input
-     * sample = L phase units.  An output is emitted whenever the running
-     * source position (in phase units) <= available.  Equivalent closed
-     * form: outputs = floor((in_frames*L - phase + (M-1)) / M)... but the
-     * exact bookkeeping is done in process(); here we give the count.
-     *
-     * Source position of output k (since current phase) advances by M phase
-     * units.  Available phase budget after consuming in_frames inputs is
-     * in_frames*L + (current leftover).  We track leftover as (L - phase)
-     * style; simplest is to mirror the loop.  Do an integer simulation. */
-    int64_t avail = (int64_t)in_frames * RF_L;   /* phase units made available */
-    int64_t pos = r->phase;                       /* phase units consumed so far in current input window start */
-    int count = 0;
-    while (pos < avail) { count++; pos += RF_M; }
-    return count;
-}
-
 /* Process: consumes all `in_frames` interleaved-or-separate input frames and
  * writes output frames.  L/R processed together.
  *
  *   inL,inR    : input sample arrays (length in_frames), float [-1,1]
  *   in_frames  : number of input frames to consume (drains all of them)
- *   outL,outR  : output buffers, must hold at least output_count() frames
+ *   outL,outR  : output buffers; worst case ceil(in_frames * RF_L / RF_M) + 1
+ *                frames (for RF_L/RF_M = 441/640, < in_frames).
  *   returns      number of output frames written.
  *
  * Persistent phase + history mean correct results across chunk boundaries.
@@ -219,14 +206,16 @@ static inline int ResamplerFixed_process(ResamplerFixed *r,
      * appending an input subtracts L from phase.
      */
     for (int i = 0; i < in_frames; ++i) {
-        /* Append newest input sample: shift history, newest at [TP-1]. */
-        for (int k = 0; k < TP - 1; ++k) {
-            r->histL[k] = r->histL[k + 1];
-            r->histR[k] = r->histR[k + 1];
-        }
-        r->histL[TP - 1] = inL[i];
-        r->histR[TP - 1] = inR[i];
-        if (r->primed < TP) r->primed++;
+        /* Append newest input sample in O(1) via the mirror buffer: write it to
+         * both histL[q] and histL[q + TP].  The last TP samples, oldest..newest,
+         * are then the contiguous window histL[q + 1 .. q + TP] (newest high) —
+         * no wraparound, so the NEON dot product below reads it directly. */
+        const int q = (r->pos + 1 == TP) ? 0 : r->pos + 1;
+        r->pos = q;
+        r->histL[q] = inL[i];  r->histL[q + TP] = inL[i];
+        r->histR[q] = inR[i];  r->histR[q + TP] = inR[i];
+        const float *winL = &r->histL[q + 1];
+        const float *winR = &r->histR[q + 1];
 
         /* One new input sample => L more phase units of source available.
          * Emit outputs while phase budget allows. */
@@ -254,19 +243,19 @@ static inline int ResamplerFixed_process(ResamplerFixed *r,
             int k = 0;
             for (; k + 4 <= TP; k += 4) {
                 float32x4_t vc  = vld1q_f32(&c[k]);
-                float32x4_t vhl = vld1q_f32(&r->histL[k]);
-                float32x4_t vhr = vld1q_f32(&r->histR[k]);
+                float32x4_t vhl = vld1q_f32(&winL[k]);
+                float32x4_t vhr = vld1q_f32(&winR[k]);
                 vaccL = vmlaq_f32(vaccL, vc, vhl);
                 vaccR = vmlaq_f32(vaccR, vc, vhr);
             }
             accL = vaddvq_f32(vaccL);
             accR = vaddvq_f32(vaccR);
-            for (; k < TP; ++k) { accL += c[k]*r->histL[k]; accR += c[k]*r->histR[k]; }
+            for (; k < TP; ++k) { accL += c[k]*winL[k]; accR += c[k]*winR[k]; }
 #else
             /* Portable, auto-vectorizable: simple contiguous MAC. */
             for (int k = 0; k < TP; ++k) {
-                accL += c[k] * r->histL[k];
-                accR += c[k] * r->histR[k];
+                accL += c[k] * winL[k];
+                accR += c[k] * winR[k];
             }
 #endif
             outL[out_n] = accL;
