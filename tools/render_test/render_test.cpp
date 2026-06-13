@@ -225,6 +225,50 @@ static int build_drums(int extra_seconds)
     return n_beats * beat + tail + extra_seconds * SAMPLE_RATE;
 }
 
+// Multitimbral: the same triad struck simultaneously on MIDI channels 1-8.
+// In Performance mode each channel drives its own part/patch, so this lights
+// up many parts at once and pushes past the 32-voice limit into voice
+// stealing — exercising the PCM voice-skip's active<->inactive transitions at
+// high polyphony, which melody/chord (single part) never reach.
+static int build_multi(int extra_seconds)
+{
+    const uint8_t triad[] = {60, 64, 67};
+    const int n_notes = (int)(sizeof(triad)/sizeof(triad[0]));
+    const int hold    = 3 * SAMPLE_RATE;
+    const int tail    = 2 * SAMPLE_RATE;
+
+    for (int ch = 0; ch < 8; ch++) {
+        for (int i = 0; i < n_notes; i++) {
+            add_event(0,    (uint8_t)(0x90 | ch), triad[i], 100, 3);
+            add_event(hold, (uint8_t)(0x80 | ch), triad[i], 0,   3);
+        }
+    }
+    return hold + tail + extra_seconds * SAMPLE_RATE;
+}
+
+// ─── performance-mode setup ─────────────────────────────────────────────────
+
+// Boot the firmware into Performance (multitimbral) mode: flip the NVRAM mode
+// byte and reset.  Must be called BEFORE warmup so the firmware initialises in
+// performance mode.  Mirrors the plugin's v2_set_mode(perf) path.
+static void enter_performance_mode(MCU *mcu)
+{
+    mcu->nvram[NVRAM_MODE_OFFSET] = 0;   // 0 = performance, 1 = patch
+    mcu->SC55_Reset();
+}
+
+// Select Preset-A performance `idx` (0-15) via Bank Select MSB + Program
+// Change on the control channel (ch16 = 0x0F).  Matches the bytes the plugin's
+// v2_select_performance emits for bank 0 (Preset A, MSB 81).
+static void select_performance(MCU *mcu, int idx)
+{
+    const uint8_t ctrl = 0x0F;
+    uint8_t bank[3] = { (uint8_t)(0xB0 | ctrl), 0x00, 81 };
+    mcu->postMidiSC55(bank, 3);
+    uint8_t pc[2]   = { (uint8_t)(0xC0 | ctrl), (uint8_t)(idx & 0x7f) };
+    mcu->postMidiSC55(pc, 2);
+}
+
 // ─── render ────────────────────────────────────────────────────────────────
 
 // Drain whatever samples updateSC55() produced into our output buffer.
@@ -244,8 +288,10 @@ static void drain(MCU *mcu, int16_t *out, int capacity,
     write_pos += to_copy;
 }
 
+// perf_index >= 0 selects Performance mode (multitimbral) with that Preset-A
+// performance; perf_index < 0 uses Patch mode with patch_index.
 static bool render(MCU *mcu, const uint8_t *rom2,
-                   int patch_index, const char *seq_name,
+                   int patch_index, int perf_index, const char *seq_name,
                    int total_seconds, const char *out_path)
 {
     // ── build MIDI sequence ──────────────────────────────────────────────
@@ -256,6 +302,8 @@ static bool render(MCU *mcu, const uint8_t *rom2,
         seq_samples = build_chord(0);
     } else if (strcmp(seq_name, "drums") == 0) {
         seq_samples = build_drums(0);
+    } else if (strcmp(seq_name, "multi") == 0) {
+        seq_samples = build_multi(0);
     } else {
         seq_samples = build_melody(0);
     }
@@ -266,15 +314,26 @@ static bool render(MCU *mcu, const uint8_t *rom2,
     int16_t *out = (int16_t *)calloc((size_t)n_samples * 2, sizeof(int16_t));
     if (!out) { fprintf(stderr, "OOM allocating output buffer\n"); return false; }
 
+    // ── enter performance mode (must precede warmup) ─────────────────────
+    if (perf_index >= 0) {
+        fprintf(stderr, "Entering performance mode...\n");
+        enter_performance_mode(mcu);
+    }
+
     // ── warmup ──────────────────────────────────────────────────────────
     fprintf(stderr, "Warming up (%d steps)...\n", WARMUP_STEPS);
     for (int i = 0; i < WARMUP_STEPS; i++) {
         mcu->updateSC55(1);
     }
 
-    // ── select patch ────────────────────────────────────────────────────
-    fprintf(stderr, "Loading patch %d...\n", patch_index);
-    load_patch(mcu, rom2, patch_index);
+    // ── select patch / performance ───────────────────────────────────────
+    if (perf_index >= 0) {
+        fprintf(stderr, "Selecting Preset-A performance %d...\n", perf_index);
+        select_performance(mcu, perf_index);
+    } else {
+        fprintf(stderr, "Loading patch %d...\n", patch_index);
+        load_patch(mcu, rom2, patch_index);
+    }
 
     // Give the emulator ~0.5 s to react to the program change before
     // we start recording — keeps the very first samples clean.
@@ -364,8 +423,10 @@ static void analyse_wav(const char *path)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s <roms_dir> <out.wav> [--patch N] [--seq melody|chord|drums] [--seconds S]\n"
-            "  N: global patch index (0=PresetA[0], 64=PresetB[0], 128=Internal[0])\n"
+            "Usage: %s <roms_dir> <out.wav> [--patch N | --perf N] [--seq melody|chord|drums|multi] [--seconds S]\n"
+            "  --patch N: Patch mode, global patch index (0=PresetA[0], 64=PresetB[0], 128=Internal[0])\n"
+            "  --perf N : Performance mode (multitimbral), Preset-A performance 0-15\n"
+            "             (use with --seq multi for many parts, or --seq drums for the rhythm part)\n"
             "  Default: --patch 0 --seq melody\n",
             prog);
 }
@@ -378,12 +439,15 @@ int main(int argc, char **argv)
     const char *out_path = argv[2];
 
     int   patch_index  = 0;
+    int   perf_index   = -1;   // <0 = patch mode; >=0 = performance mode
     const char *seq    = "melody";
     int   total_seconds = 0;   // 0 = use sequence natural length
 
     for (int i = 3; i < argc; i++) {
         if (strcmp(argv[i], "--patch") == 0 && i+1 < argc) {
             patch_index = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--perf") == 0 && i+1 < argc) {
+            perf_index = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--seq") == 0 && i+1 < argc) {
             seq = argv[++i];
         } else if (strcmp(argv[i], "--seconds") == 0 && i+1 < argc) {
@@ -444,7 +508,7 @@ int main(int argc, char **argv)
     free(nvram_data);
 
     // ── render ────────────────────────────────────────────────────────────
-    bool ok = render(mcu, rom2_copy, patch_index, seq, total_seconds, out_path);
+    bool ok = render(mcu, rom2_copy, patch_index, perf_index, seq, total_seconds, out_path);
 
     // ── analyse ──────────────────────────────────────────────────────────
     if (ok) {
