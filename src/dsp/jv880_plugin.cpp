@@ -36,9 +36,11 @@ static void jv_debug(const char *fmt, ...) {
 
 /* ========================================================================
  * PERFORMANCE STATS INSTRUMENTATION
- * Set to 0 to compile out all instrumentation (zero overhead).
+ * Set to 1 to enable instrumentation (per-iteration clock_gettime, a 15s
+ * stderr/perf_stats.txt report, and the "perf_stats" get_param); 0 compiles
+ * it all out for zero overhead.  Ship with this OFF.
  * ======================================================================== */
-#define JV880_PERF_STATS 1
+#define JV880_PERF_STATS 0
 
 /* Patch data constants */
 #define PATCH_SIZE 0x16a  /* 362 bytes per patch */
