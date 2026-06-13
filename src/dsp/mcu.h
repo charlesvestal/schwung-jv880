@@ -217,6 +217,7 @@ struct mcu_t {
   uint8_t interrupt_pending[INTERRUPT_SOURCE_MAX];
   uint8_t trapa_pending[16];
   uint64_t cycles;
+  uint8_t interrupt_pending_any; // 1 = scan needed; cleared by Handle when nothing pending
 };
 
 enum {
@@ -327,6 +328,11 @@ struct MCU {
   int16_t sample_buffer[audio_buffer_size] = {0};
   int sample_write_ptr = 0;
 
+  /* Probe: fraction of emulated instruction slots spent in SLEEP
+   * (read by the plugin's perf reporting; ~free to maintain) */
+  uint64_t probe_steps = 0;
+  uint64_t probe_sleep_steps = 0;
+
   MCU();
 
   int startSC55(const uint8_t *s_rom1, const uint8_t *s_rom2,
@@ -363,6 +369,15 @@ struct MCU {
   void TIMER_Write(const uint32_t address, const uint8_t data);
   uint8_t TIMER_Read(const uint32_t address);
   void TIMER_Clock(const uint64_t cycles);
+
+  // Replays the FRT counters for n skipped TIMER_Clock calls (SLEEP fast-forward).
+  void FRT_AdvanceSkipped(uint64_t n);
+
+  // Returns the earliest mcu.cycles value (a multiple of 12, strictly greater
+  // than the current mcu.cycles) at which ANY peripheral could do something
+  // observable, used to fast-forward through SLEEP. Returns UINT64_MAX if no
+  // peripheral has a bounded next event.
+  uint64_t MCU_NextEventCycles();
 
   void TIMER2_Write(const uint32_t address, const uint8_t data);
   uint8_t TIMER_Read2(const uint32_t address);
@@ -550,14 +565,18 @@ struct MCU {
   inline void MCU_Interrupt_SetRequest(const uint32_t interrupt,
                                        const uint32_t value) {
     mcu.interrupt_pending[interrupt] = value;
+    if (value)
+      mcu.interrupt_pending_any = 1;
   }
 
   inline void MCU_Interrupt_Exception(const uint32_t exception) {
     mcu.exception_pending = exception;
+    mcu.interrupt_pending_any = 1; // exception may need servicing
   }
 
   inline void MCU_Interrupt_TRAPA(const uint32_t vector) {
     mcu.trapa_pending[vector] = 1;
+    mcu.interrupt_pending_any = 1;
   }
 
   inline void MCU_Interrupt_StartVector(const uint32_t vector,

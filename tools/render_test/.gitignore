@@ -1,0 +1,6 @@
+baseline/
+out/
+*.wav
+render_test
+render_test_opt
+out_opt/

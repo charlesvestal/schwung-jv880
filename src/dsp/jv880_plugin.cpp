@@ -21,6 +21,9 @@
 extern "C" {
 #include "resample/libresample.h"
 }
+/* Fixed-ratio 64000->44100 polyphase resampler (replaces libresample in the
+ * v2 emu thread path; libresample left vendored/included for v1 or reference). */
+#include "resampler_fixed.h"
 
 extern "C" {
 #include "plugin_api_v1.h"
@@ -30,6 +33,12 @@ extern "C" {
 static void jv_debug(const char *fmt, ...) {
     (void)fmt;
 }
+
+/* ========================================================================
+ * PERFORMANCE STATS INSTRUMENTATION
+ * Set to 0 to compile out all instrumentation (zero overhead).
+ * ======================================================================== */
+#define JV880_PERF_STATS 1
 
 /* Patch data constants */
 #define PATCH_SIZE 0x16a  /* 362 bytes per patch */
@@ -434,13 +443,19 @@ typedef struct {
     int save_slot_index;
     int load_slot_index;
 
-    /* Resampling state (libresample) */
+    /* Resampling state (libresample) - retained for v1 / reference; v2 path
+     * now uses the fixed-ratio polyphase resampler below. */
     void *resampleL;
     void *resampleR;
     float resample_in_l[4096];  /* Input buffer for resampler */
     float resample_in_r[4096];
     float resample_out_l[4096]; /* Output buffer for resampler */
     float resample_out_r[4096];
+
+    /* Fixed-ratio 64000->44100 polyphase resampler (v2 path).  Carries L+R
+     * history and persistent fractional phase so chunked input across
+     * iterations resamples correctly. */
+    ResamplerFixed rfix;
 
     /* Loading state */
     char loading_status[256];
@@ -506,6 +521,27 @@ typedef struct {
     int macro_decay;         /* offset for tvaenvtime2 */
     int macro_release;       /* offset for tvaenvtime4 */
     int macro_tvf_env_depth; /* offset for tvfenvdepth */
+
+#if JV880_PERF_STATS
+    /* Per-window accumulators (reset every 15-second report window) */
+    uint64_t perf_ns_emu;         /* Thread CPU ns spent in updateSC55 */
+    uint64_t perf_ns_resamp;      /* Thread CPU ns spent in convert+resample+ringwrite */
+    uint64_t perf_ns_total;       /* Total thread CPU ns for all working iterations */
+    uint64_t perf_loop_iters;     /* Working iterations in this window */
+    uint64_t perf_sleep_iters;    /* Ring-full (sleep) iterations in this window */
+    uint64_t perf_emu_calls;      /* updateSC55 calls in this window */
+    /* Wall-clock deadline for next report (CLOCK_MONOTONIC ns) */
+    uint64_t perf_next_report_ns;
+    /* Wall-clock ns at start of this window (for thread_cpu%wall) */
+    uint64_t perf_wall_window_ns;
+    /* Thread CPU ns at start of this window */
+    uint64_t perf_cpu_window_ns;
+    /* MCU sleep-fraction probe: window-start snapshots of mcu counters */
+    uint64_t perf_probe_steps0;
+    uint64_t perf_probe_sleep0;
+    /* Last formatted report line (returned by get_param "perf_stats") */
+    char perf_stats_buf[256];
+#endif /* JV880_PERF_STATS */
 } jv880_instance_t;
 
 /* Forward declarations for v2 helper functions */
@@ -1174,11 +1210,15 @@ static void* v2_load_thread_func(void *arg) {
     inst->ring_write = 0;
     inst->ring_read = 0;
 
-    /* Initialize high-quality resampler (66207 Hz -> 48000 Hz) */
+    /* Initialize fixed-ratio polyphase resampler (64000 Hz -> 44100 Hz,
+     * L=441 M=640).  Builds its coefficient bank once here. */
     double ratio = (double)MOVE_SAMPLE_RATE / (double)JV880_SAMPLE_RATE;
-    inst->resampleL = resample_open(1, ratio, ratio);  /* High quality */
-    inst->resampleR = resample_open(1, ratio, ratio);
-    fprintf(stderr, "JV880 v2: Resampler initialized (ratio %.4f)\n", ratio);
+    inst->resampleL = nullptr;
+    inst->resampleR = nullptr;
+    ResamplerFixed_init(&inst->rfix);
+    fprintf(stderr, "JV880 v2: Fixed-ratio resampler initialized (ratio %.4f, "
+                    "L=%d M=%d, %d taps/phase)\n",
+            ratio, RF_L, RF_M, RF_TAPS_PER_PHASE);
 
     fprintf(stderr, "JV880 v2: Pre-filling buffer...\n");
     snprintf(inst->loading_status, sizeof(inst->loading_status), "Preparing audio...");
@@ -1194,13 +1234,10 @@ static void* v2_load_thread_func(void *arg) {
                 inst->resample_in_r[j] = (float)inst->mcu->sample_buffer[j * 2 + 1] / 32768.0f;
             }
 
-            /* Resample */
-            int inUsedL = 0, inUsedR = 0;
-            int outL = resample_process(inst->resampleL, ratio, inst->resample_in_l, in_samples,
-                                        0, &inUsedL, inst->resample_out_l, 4096);
-            int outR = resample_process(inst->resampleR, ratio, inst->resample_in_r, in_samples,
-                                        0, &inUsedR, inst->resample_out_r, 4096);
-            int out_samples = (outL < outR) ? outL : outR;
+            /* Resample (fixed-ratio polyphase, L+R together) */
+            int out_samples = ResamplerFixed_process(&inst->rfix,
+                                  inst->resample_in_l, inst->resample_in_r, in_samples,
+                                  inst->resample_out_l, inst->resample_out_r);
 
             /* Copy to ring buffer */
             for (int j = 0; j < out_samples && inst->ring_write < AUDIO_RING_SIZE / 2; j++) {
@@ -1439,12 +1476,64 @@ static int v2_ring_free(jv880_instance_t *inst) {
     return AUDIO_RING_SIZE - 1 - v2_ring_available(inst);
 }
 
+/* v2: Per-thread performance setup for the emulator thread.
+ * - Pins to cores 0-2 (core 3 is reserved for the SPI audio callback).
+ * - Requests SCHED_FIFO 45 (below MoveOriginal audio threads at FIFO 70,
+ *   well below the SPI thread at FIFO 90). EPERM is non-fatal.
+ * - Flushes aarch64 denormals to zero via FPCR bit 24.
+ */
+static void v2_emu_thread_setup(void) {
+#ifdef __linux__
+    /* CPU affinity: cores 0, 1, 2 */
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(0, &cpuset);
+    CPU_SET(1, &cpuset);
+    CPU_SET(2, &cpuset);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset) != 0) {
+        fprintf(stderr, "JV880 v2: Failed to set CPU affinity: %s\n", strerror(errno));
+    }
+
+    /* Real-time scheduling: SCHED_FIFO priority 45 */
+    struct sched_param sp;
+    sp.sched_priority = 45;
+    int rc = pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    if (rc != 0) {
+        fprintf(stderr, "JV880 v2: Could not set SCHED_FIFO 45 (%s) — continuing with default scheduling\n",
+                strerror(rc));
+    }
+#endif /* __linux__ */
+
+#ifdef __aarch64__
+    /* Flush-to-zero for float32/float64 denormals (FPCR bit 24) */
+    uint64_t fpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ull << 24);
+    __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr));
+#endif /* __aarch64__ */
+}
+
 /* v2: Emulator thread */
 static void* v2_emu_thread_func(void *arg) {
     jv880_instance_t *inst = (jv880_instance_t*)arg;
+    v2_emu_thread_setup();
     fprintf(stderr, "JV880 v2: Emulation thread started\n");
 
-    const double ratio = (double)MOVE_SAMPLE_RATE / (double)JV880_SAMPLE_RATE;
+#if JV880_PERF_STATS
+    /* Helper lambda-like macro: read ns from a timespec */
+#define TS_NS(ts) ((uint64_t)(ts).tv_sec * 1000000000ULL + (uint64_t)(ts).tv_nsec)
+
+    /* Seed window start values */
+    {
+        struct timespec ts_wall, ts_cpu;
+        clock_gettime(CLOCK_MONOTONIC, &ts_wall);
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu);
+        inst->perf_wall_window_ns = TS_NS(ts_wall);
+        inst->perf_cpu_window_ns  = TS_NS(ts_cpu);
+        /* First report after 15 s of wall time */
+        inst->perf_next_report_ns = inst->perf_wall_window_ns + 15000000000ULL;
+    }
+#endif /* JV880_PERF_STATS */
 
     while (inst->thread_running) {
         /* Handle warmup after SC55_Reset */
@@ -1475,14 +1564,37 @@ static void* v2_emu_thread_func(void *arg) {
             inst->map_sysex_len = 0;
         }
 
-        /* Check if we need more audio */
+        /* Check if we need more audio.
+         * Sleep ~1ms when the ring is full: the consumer drains 128 frames
+         * per ~2.9ms, so 64 frames free takes ~1.45ms.  A 50us poll here
+         * meant ~20k wakeups/s of syscall+scheduler overhead on the A72,
+         * which dominated the thread's CPU once emulation got cheaper.
+         * Latency is unaffected: the ring is already at max fill when we
+         * sleep, and 1ms of drain (~44 frames) is refilled in well under
+         * a millisecond of emulation. */
         int free_space = v2_ring_free(inst);
         if (free_space < 64) {
-            usleep(50);
+#if JV880_PERF_STATS
+            inst->perf_sleep_iters++;
+#endif
+            usleep(1000);
             continue;
         }
 
+#if JV880_PERF_STATS
+        /* --- T0: start of working iteration --- */
+        struct timespec ts_t0, ts_t1, ts_t2;
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_t0);
+#endif
+
         inst->mcu->updateSC55(64);
+
+#if JV880_PERF_STATS
+        /* --- T1: after updateSC55 --- */
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_t1);
+        inst->perf_emu_calls++;
+#endif
+
         int avail = inst->mcu->sample_write_ptr;
         int in_samples = avail / 2;  /* Stereo pairs */
 
@@ -1493,14 +1605,11 @@ static void* v2_emu_thread_func(void *arg) {
                 inst->resample_in_r[i] = (float)inst->mcu->sample_buffer[i * 2 + 1] / 32768.0f;
             }
 
-            /* Resample using high-quality polyphase filter */
-            int inUsedL = 0, inUsedR = 0;
-            int outL = resample_process(inst->resampleL, ratio, inst->resample_in_l, in_samples,
-                                        0, &inUsedL, inst->resample_out_l, 4096);
-            int outR = resample_process(inst->resampleR, ratio, inst->resample_in_r, in_samples,
-                                        0, &inUsedR, inst->resample_out_r, 4096);
-
-            int out_samples = (outL < outR) ? outL : outR;
+            /* Resample using fixed-ratio polyphase filter (L+R together,
+             * persistent phase state across chunk boundaries). */
+            int out_samples = ResamplerFixed_process(&inst->rfix,
+                                  inst->resample_in_l, inst->resample_in_r, in_samples,
+                                  inst->resample_out_l, inst->resample_out_r);
 
             /* Batch copy to ring buffer with single lock */
             if (out_samples > 0) {
@@ -1521,7 +1630,96 @@ static void* v2_emu_thread_func(void *arg) {
                 pthread_mutex_unlock(&inst->ring_mutex);
             }
         }
+
+#if JV880_PERF_STATS
+        /* --- T2: end of convert+resample+ringwrite block --- */
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_t2);
+
+        {
+            uint64_t ns0 = TS_NS(ts_t0);
+            uint64_t ns1 = TS_NS(ts_t1);
+            uint64_t ns2 = TS_NS(ts_t2);
+            inst->perf_ns_emu    += ns1 - ns0;
+            inst->perf_ns_resamp += ns2 - ns1;
+            inst->perf_ns_total  += ns2 - ns0;
+        }
+        inst->perf_loop_iters++;
+
+        /* Periodic report: check wall clock once per working iteration */
+        {
+            struct timespec ts_wall_now;
+            clock_gettime(CLOCK_MONOTONIC, &ts_wall_now);
+            uint64_t wall_now_ns = TS_NS(ts_wall_now);
+            if (wall_now_ns >= inst->perf_next_report_ns) {
+                /* Compute wall and cpu deltas for the window */
+                struct timespec ts_cpu_now;
+                clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts_cpu_now);
+                uint64_t cpu_now_ns  = TS_NS(ts_cpu_now);
+
+                uint64_t wall_delta = wall_now_ns  - inst->perf_wall_window_ns;
+                uint64_t cpu_delta  = cpu_now_ns   - inst->perf_cpu_window_ns;
+
+                /* Compute percentages (avoid divide-by-zero) */
+                double pct_emu    = (inst->perf_ns_total > 0)
+                    ? 100.0 * (double)inst->perf_ns_emu    / (double)inst->perf_ns_total : 0.0;
+                double pct_resamp = (inst->perf_ns_total > 0)
+                    ? 100.0 * (double)inst->perf_ns_resamp / (double)inst->perf_ns_total : 0.0;
+                double pct_other  = 100.0 - pct_emu - pct_resamp;
+                double pct_cpu_wall = (wall_delta > 0)
+                    ? 100.0 * (double)cpu_delta / (double)wall_delta : 0.0;
+
+                double wall_s = (double)wall_delta / 1e9;
+                double loops_s  = (wall_s > 0.0) ? (double)inst->perf_loop_iters  / wall_s : 0.0;
+                double sleeps_s = (wall_s > 0.0) ? (double)inst->perf_sleep_iters / wall_s : 0.0;
+
+                uint64_t probe_steps_d = inst->mcu->probe_steps - inst->perf_probe_steps0;
+                uint64_t probe_sleep_d = inst->mcu->probe_sleep_steps - inst->perf_probe_sleep0;
+                double mcu_sleep_frac = (probe_steps_d > 0)
+                    ? 100.0 * (double)probe_sleep_d / (double)probe_steps_d : 0.0;
+
+                snprintf(inst->perf_stats_buf, sizeof(inst->perf_stats_buf),
+                    "JV880 perf: emu=%.1f%% resamp=%.1f%% other=%.1f%% of thread cpu"
+                    " | thread_cpu=%.1f%% wall | sleeps/s=%.0f loops/s=%.0f"
+                    " | mcu_sleep=%.1f%%",
+                    pct_emu, pct_resamp, pct_other,
+                    pct_cpu_wall, sleeps_s, loops_s, mcu_sleep_frac);
+
+                fprintf(stderr, "%s\n", inst->perf_stats_buf);
+
+                /* MoveOriginal's stderr is discarded on-device; also drop the
+                 * line into the module dir so it can be read over ssh.  One
+                 * tiny write per 15s from this (non-SPI) thread is harmless. */
+                {
+                    char perf_path[600];
+                    snprintf(perf_path, sizeof(perf_path), "%s/perf_stats.txt",
+                             inst->module_dir);
+                    FILE *pf = fopen(perf_path, "w");
+                    if (pf) {
+                        fprintf(pf, "%s\n", inst->perf_stats_buf);
+                        fclose(pf);
+                    }
+                }
+
+                /* Reset window accumulators */
+                inst->perf_ns_emu        = 0;
+                inst->perf_ns_resamp     = 0;
+                inst->perf_ns_total      = 0;
+                inst->perf_loop_iters    = 0;
+                inst->perf_sleep_iters   = 0;
+                inst->perf_emu_calls     = 0;
+                inst->perf_wall_window_ns = wall_now_ns;
+                inst->perf_cpu_window_ns  = cpu_now_ns;
+                inst->perf_probe_steps0   = inst->mcu->probe_steps;
+                inst->perf_probe_sleep0   = inst->mcu->probe_sleep_steps;
+                inst->perf_next_report_ns = wall_now_ns + 15000000000ULL;
+            }
+        }
+#endif /* JV880_PERF_STATS */
     }
+
+#if JV880_PERF_STATS
+#undef TS_NS
+#endif
 
     fprintf(stderr, "JV880 v2: Emulation thread stopped\n");
     return NULL;
@@ -3554,6 +3752,13 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return -1;
     }
 
+#if JV880_PERF_STATS
+    if (strcmp(key, "perf_stats") == 0) {
+        /* Return the last formatted perf report line (empty string until first report fires) */
+        return snprintf(buf, buf_len, "%s", inst->perf_stats_buf);
+    }
+#endif /* JV880_PERF_STATS */
+
     return -1;
 }
 
@@ -3654,8 +3859,9 @@ static plugin_api_v2_t jv880_api_v2 = {
     v2_render_block
 };
 
-/* v2 Entry Point */
-extern "C" plugin_api_v2_t* move_plugin_init_v2(const host_api_v1_t *host) {
+/* v2 Entry Point (default visibility required: built with -fvisibility=hidden) */
+extern "C" __attribute__((visibility("default")))
+plugin_api_v2_t* move_plugin_init_v2(const host_api_v1_t *host) {
     (void)host;
     jv_debug("[JV880] v2 API initialized\n");
     return &jv880_api_v2;

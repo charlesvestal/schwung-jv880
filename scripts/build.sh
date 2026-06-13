@@ -50,8 +50,9 @@ mkdir -p dist/minijv/roms/expansions
 # Compile resample library (C code)
 echo "Compiling resample library..."
 for f in resample resamplesubs filterkit; do
-    ${CROSS_PREFIX}gcc -Ofast -c -fPIC \
-        -march=armv8-a -mtune=cortex-a72 \
+    ${CROSS_PREFIX}gcc -Ofast -c -fPIC -flto \
+        -mcpu=cortex-a72 \
+        -fvisibility=hidden -fno-semantic-interposition \
         -fomit-frame-pointer -fno-stack-protector \
         -DNDEBUG \
         src/dsp/resample/${f}.c \
@@ -61,8 +62,10 @@ done
 
 # Compile DSP plugin (with aggressive optimizations for CM4)
 echo "Compiling DSP plugin..."
-${CROSS_PREFIX}g++ -Ofast -shared -fPIC -std=c++11 \
-    -march=armv8-a -mtune=cortex-a72 \
+${CROSS_PREFIX}g++ -Ofast -shared -fPIC -std=c++11 -flto \
+    -mcpu=cortex-a72 \
+    -funroll-loops \
+    -fvisibility=hidden -fno-semantic-interposition \
     -fno-exceptions -fno-rtti \
     -fomit-frame-pointer -fno-stack-protector \
     -DNDEBUG \
