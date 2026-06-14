@@ -1,136 +1,278 @@
 {
-  "id": "minijv",
-  "name": "Mini-JV",
-  "abbrev": "JV",
-  "version": "0.4.12",
-  "description": "ROM-based PCM rompler emulator",
-  "author": "nukeykt/giulioz (port: charlesvestal)",
-  "license": "Non-commercial",
-  "ui": "ui.js",
-  "dsp": "dsp.so",
-  "api_version": 2,
-  "raw_ui": true,
-  "raw_midi": true,
-  "standalone": false,
-  "assets": {
-    "path": "roms",
-    "label": "ROMs",
-    "extensions": [
-      ".bin",
-      ".rom"
-    ],
-    "allowFolders": true,
-    "description": "Requires JV-880 v1.0.0 ROM files",
-    "hint": "The plugin requires the v1.0.0 ROMs. Version 1.0.1 will NOT work.",
-    "hint_url": "https://github.com/charlesvestal/schwung-jv880",
-    "hint_url_label": "Read more",
-    "files": [
-      {
-        "filename": "jv880_rom1.bin",
-        "label": "CPU ROM",
-        "size": 32768,
-        "crc32": "B3D611B1",
-        "required": true
-      },
-      {
-        "filename": "jv880_rom2.bin",
-        "label": "Patch ROM",
-        "size": 262144,
-        "crc32": "B266EFE9",
-        "required": true
-      },
-      {
-        "filename": "jv880_waverom1.bin",
-        "label": "Waveform ROM 1",
-        "size": 2097152,
-        "crc32": "1348C0DC",
-        "required": true
-      },
-      {
-        "filename": "jv880_waverom2.bin",
-        "label": "Waveform ROM 2",
-        "size": 2097152,
-        "crc32": "D55FCF90",
-        "required": true
-      },
-      {
-        "filename": "jv880_nvram.bin",
-        "label": "NVRAM (user patches)",
-        "size": 32768,
-        "required": true
-      }
-    ],
-    "folders": [
-      {
-        "path": "expansions",
-        "label": "Expansion ROMs",
-        "description": "SR-JV80 expansion cards (8MB or 2MB .bin files)",
-        "extensions": [".bin", ".BIN"],
-        "required": false
-      }
-    ]
-  },
-  "capabilities": {
-    "audio_out": true,
-    "audio_in": false,
-    "midi_in": true,
-    "midi_out": false,
-    "midi_channels": 16,
-    "chainable": true,
-    "component_type": "sound_generator",
-    "ui_hierarchy": {
-      "levels": {
-        "root": {
-          "name": "Mini-JV",
-          "params": [
-            "mode",
-            "preset",
-            "performance",
-            "octave_transpose"
-          ],
-          "knobs": [
-            "preset",
-            "octave_transpose"
-          ]
-        }
-      }
-    },
-    "default_forward_channel": 1,
-    "chain_params": [
-      {
-        "key": "mode",
-        "name": "Mode",
-        "type": "enum",
-        "options": [
-          "Patch",
-          "Performance"
+    "id": "minijv",
+    "name": "Mini-JV",
+    "abbrev": "JV",
+    "version": "0.4.12",
+    "description": "ROM-based PCM rompler emulator",
+    "author": "nukeykt/giulioz (port: charlesvestal)",
+    "license": "Non-commercial",
+    "ui": "ui.js",
+    "dsp": "dsp.so",
+    "api_version": 2,
+    "raw_ui": true,
+    "raw_midi": true,
+    "standalone": false,
+    "assets": {
+        "path": "roms",
+        "label": "ROMs",
+        "extensions": [
+            ".bin",
+            ".rom"
         ],
-        "default": 0
-      },
-      {
-        "key": "preset",
-        "name": "Preset",
-        "type": "int",
-        "min": 0,
-        "max_param": "preset_count",
-        "default": 0
-      },
-      {
-        "key": "performance",
-        "name": "Performance",
-        "type": "int",
-        "min": 0,
-        "max": 47,
-        "default": 0
-      },
-      {
-        "key": "octave_transpose",
-        "name": "Octave",
-        "type": "int",
-        "min": -4,
-        "max": 4,
-        "default": 0
-      }
-    ]
-  }
+        "allowFolders": true,
+        "description": "Requires JV-880 v1.0.0 ROM files",
+        "hint": "The plugin requires the v1.0.0 ROMs. Version 1.0.1 will NOT work.",
+        "hint_url": "https://github.com/charlesvestal/schwung-jv880",
+        "hint_url_label": "Read more",
+        "files": [
+            {
+                "filename": "jv880_rom1.bin",
+                "label": "CPU ROM",
+                "size": 32768,
+                "crc32": "B3D611B1",
+                "required": true
+            },
+            {
+                "filename": "jv880_rom2.bin",
+                "label": "Patch ROM",
+                "size": 262144,
+                "crc32": "B266EFE9",
+                "required": true
+            },
+            {
+                "filename": "jv880_waverom1.bin",
+                "label": "Waveform ROM 1",
+                "size": 2097152,
+                "crc32": "1348C0DC",
+                "required": true
+            },
+            {
+                "filename": "jv880_waverom2.bin",
+                "label": "Waveform ROM 2",
+                "size": 2097152,
+                "crc32": "D55FCF90",
+                "required": true
+            },
+            {
+                "filename": "jv880_nvram.bin",
+                "label": "NVRAM (user patches)",
+                "size": 32768,
+                "required": true
+            }
+        ],
+        "folders": [
+            {
+                "path": "expansions",
+                "label": "Expansion ROMs",
+                "description": "SR-JV80 expansion cards (8MB or 2MB .bin files)",
+                "extensions": [
+                    ".bin",
+                    ".BIN"
+                ],
+                "required": false
+            }
+        ]
+    },
+    "capabilities": {
+        "audio_out": true,
+        "audio_in": false,
+        "midi_in": true,
+        "midi_out": false,
+        "midi_channels": 16,
+        "chainable": true,
+        "component_type": "sound_generator",
+        "ui_hierarchy": {
+            "_note": "Mirror of the ui_hierarchy generated by get_param() in jv880_plugin.cpp (the LIVE path in a Signal Chain slot, rendered by the platform's shadow_ui.js). Per-tone editing uses EXPLICIT per-tone levels (tone1..tone4, tone1_wave..tone4_fx) with fully-qualified nvram_tone_<n>_<param> keys, because the chain renderer keys every entry as synth:<key> and has NO tone_section/tone_prefix support and does not carry a child_prefix context into navigated sub-levels. This mirror shows tone1 explicitly; tone2..tone4 are identical with the index changed. Full param lists live in the C source.",
+            "levels": {
+                "root": {
+                    "name": "Mini-JV",
+                    "params": [
+                        "macro_cutoff",
+                        "macro_resonance",
+                        "macro_attack",
+                        "macro_decay",
+                        "macro_sustain",
+                        "macro_release",
+                        "macro_tvf_env_depth",
+                        "macro_lfo_depth",
+                        "nvram_patchCommon_reverblevel",
+                        "nvram_patchCommon_choruslevel",
+                        "mode",
+                        "preset",
+                        "performance",
+                        "octave_transpose"
+                    ],
+                    "knobs": [
+                        "macro_cutoff",
+                        "macro_resonance",
+                        "macro_attack",
+                        "macro_decay",
+                        "macro_sustain",
+                        "macro_release",
+                        "macro_tvf_env_depth",
+                        "macro_lfo_depth"
+                    ]
+                },
+                "tone_selector": {
+                    "name": "Tones",
+                    "knobs": [],
+                    "params": [
+                        { "level": "tone1", "label": "Tone 1" },
+                        { "level": "tone2", "label": "Tone 2" },
+                        { "level": "tone3", "label": "Tone 3" },
+                        { "level": "tone4", "label": "Tone 4" }
+                    ]
+                },
+                "tone1": {
+                    "name": "Tone 1",
+                    "knobs": ["nvram_tone_0_cutofffrequency", "nvram_tone_0_resonance", "nvram_tone_0_tvaenvtime1", "nvram_tone_0_tvaenvtime2", "nvram_tone_0_tvaenvlevel3", "nvram_tone_0_tvaenvtime4", "nvram_tone_0_level", "nvram_tone_0_pan"],
+                    "knob_labels": ["Cut", "Res", "Atk", "Dcy", "Sus", "Rel", "Lvl", "Pan"],
+                    "params": [
+                        { "key": "nvram_tone_0_toneswitch", "label": "Tone Switch" },
+                        { "level": "tone1_wave", "label": "Wave" },
+                        { "level": "tone1_pitch", "label": "Pitch" },
+                        { "level": "tone1_filter", "label": "Filter" },
+                        { "level": "tone1_amp", "label": "Amp" },
+                        { "level": "tone1_lfo1", "label": "LFO 1" },
+                        { "level": "tone1_lfo2", "label": "LFO 2" },
+                        { "level": "tone1_fx", "label": "FX Sends" }
+                    ]
+                },
+                "tone1_wave":   { "name": "Wave",     "knobs": ["nvram_tone_0_cutofffrequency", "nvram_tone_0_resonance", "nvram_tone_0_tvaenvtime1", "nvram_tone_0_tvaenvtime2", "nvram_tone_0_tvaenvlevel3", "nvram_tone_0_tvaenvtime4", "nvram_tone_0_level", "nvram_tone_0_pan"], "params": [{ "key": "nvram_tone_0_toneswitch", "label": "Tone Switch" }] },
+                "tone1_pitch":  { "name": "Pitch",    "_note": "explicit nvram_tone_0_* keys; see C source" },
+                "tone1_filter": { "name": "Filter",   "_note": "explicit nvram_tone_0_* keys; see C source" },
+                "tone1_amp":    { "name": "Amp",      "_note": "explicit nvram_tone_0_* keys; see C source" },
+                "tone1_lfo1":   { "name": "LFO 1",    "_note": "explicit nvram_tone_0_* keys; see C source" },
+                "tone1_lfo2":   { "name": "LFO 2",    "_note": "explicit nvram_tone_0_* keys; see C source" },
+                "tone1_fx":     { "name": "FX Sends", "_note": "explicit nvram_tone_0_* keys; see C source" },
+                "tone2_etc":    { "name": "(tone2..tone4 mirror tone1 with the index changed; see C source)" },
+                "save_slot":   { "name": "Save to Slot", "items_param": "save_patch_slot_list", "select_param": "do_save_to_slot", "navigate_to": "patch", "knobs": [] }
+            }
+        },
+        "default_forward_channel": 1,
+        "chain_params": [
+            {
+                "key": "mode",
+                "name": "Mode",
+                "type": "enum",
+                "options": [
+                    "Patch",
+                    "Performance"
+                ],
+                "default": 0
+            },
+            {
+                "key": "preset",
+                "name": "Preset",
+                "type": "int",
+                "min": 0,
+                "max_param": "preset_count",
+                "default": 0
+            },
+            {
+                "key": "performance",
+                "name": "Performance",
+                "type": "int",
+                "min": 0,
+                "max": 47,
+                "default": 0
+            },
+            {
+                "key": "octave_transpose",
+                "name": "Octave",
+                "type": "int",
+                "min": -4,
+                "max": 4,
+                "default": 0
+            },
+            {
+                "key": "macro_cutoff",
+                "name": "Cutoff",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1,
+                "default": 0
+            },
+            {
+                "key": "macro_resonance",
+                "name": "Resonance",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1,
+                "default": 0
+            },
+            {
+                "key": "macro_attack",
+                "name": "Attack",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1,
+                "default": 0
+            },
+            {
+                "key": "macro_decay",
+                "name": "Decay",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1,
+                "default": 0
+            },
+            {
+                "key": "macro_sustain",
+                "name": "Sustain",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1
+            },
+            {
+                "key": "macro_release",
+                "name": "Release",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1,
+                "default": 0
+            },
+            {
+                "key": "macro_tvf_env_depth",
+                "name": "TVF Env",
+                "type": "int",
+                "min": -63,
+                "max": 63,
+                "step": 1,
+                "default": 0
+            },
+            {
+                "key": "macro_lfo_depth",
+                "name": "LFO Depth",
+                "type": "int",
+                "min": -63,
+                "max": 63,
+                "step": 1
+            },
+            {
+                "key": "nvram_patchCommon_reverblevel",
+                "name": "Reverb",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1,
+                "default": 0
+            },
+            {
+                "key": "nvram_patchCommon_choruslevel",
+                "name": "Chorus",
+                "type": "int",
+                "min": 0,
+                "max": 127,
+                "step": 1,
+                "default": 0
+            }
+        ]
+    }
 }

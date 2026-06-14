@@ -323,6 +323,165 @@ static const ToneParamEntry* find_tone_param(const char *name) {
 }
 
 /* ========================================================================
+ * MACRO ABSTRACTION
+ *
+ * All 6 cross-tone macros funnel through exactly one read/write pair
+ * (macro_read / macro_write, defined later once the instance type and the
+ * per-tone write helper are visible). The behavior is selected by a single
+ * runtime mode:
+ *
+ *   MACRO_ABSOLUTE_ANCHORED  (default) - display = anchor tone's stored value
+ *       (anchor = lowest-numbered enabled tone, else tone 0); writing applies
+ *       delta = new - anchor_value to every enabled tone via the normal
+ *       nvram_tone_* write path. No hidden state; survives patch reload only
+ *       as ordinary tone edits; do_save_to_slot captures it.
+ *
+ *   MACRO_RELATIVE_RESET - the legacy behavior: an offset stored per macro in
+ *       the instance, applied (non-destructively) over the tones' base values
+ *       via SysEx, and cleared on program change.
+ *
+ * Acceptance: switching modes is a one-string change with no other code or
+ * table edits. macro_def_t below is the single source of truth for the 6 macros.
+ * ======================================================================== */
+
+typedef enum {
+    MACRO_ABSOLUTE_ANCHORED,
+    MACRO_RELATIVE_RESET
+} macro_mode_t;
+
+#define MACRO_MODE_DEFAULT MACRO_ABSOLUTE_ANCHORED
+
+typedef struct {
+    const char *key;            /* macro key suffix, e.g. "cutoff" (full key: macro_cutoff) */
+    const char *display_name;   /* short UI label */
+    const char *tone_param;     /* backing nvram_tone_* parameter name */
+    int min;                    /* display/clamp min */
+    int max;                    /* display/clamp max */
+} macro_def_t;
+
+/* The 6 macros. Ranges match the backing tone params:
+ *   cutofffrequency/resonance/tvaenvtime{1,2,4}: unsigned 0..127
+ *   tvfenvdepth: signed -63..63
+ */
+static const macro_def_t MACRO_DEFS[] = {
+    {"cutoff",        "Cutoff",      "cutofffrequency",   0, 127},
+    {"resonance",     "Resonance",   "resonance",         0, 127},
+    {"attack",        "Attack",      "tvaenvtime1",       0, 127},
+    {"decay",         "Decay",       "tvaenvtime2",       0, 127},
+    {"sustain",       "Sustain",     "tvaenvlevel3",      0, 127},
+    {"release",       "Release",     "tvaenvtime4",       0, 127},
+    {"tvf_env_depth", "Filter Env",  "tvfenvdepth",     -63,  63},
+    {"lfo_depth",     "LFO Depth",   "lfo1tvfdepth",    -63,  63},
+};
+#define NUM_MACROS (sizeof(MACRO_DEFS) / sizeof(MACRO_DEFS[0]))
+
+static int clamp_int(int value, int min_val, int max_val);  /* defined below */
+
+static const macro_def_t* find_macro(const char *key_suffix) {
+    for (size_t i = 0; i < NUM_MACROS; i++) {
+        if (strcmp(key_suffix, MACRO_DEFS[i].key) == 0) return &MACRO_DEFS[i];
+    }
+    return NULL;
+}
+
+/* ---- Patch Common parameters (FX + control section) -------------------
+ * One table drives get, set, and state serialization. Each entry maps a
+ * nvram_patchCommon_<name> param to a byte offset within the 362-byte patch
+ * + a bitfield (shift,width), plus the Roland Patch-Common SysEx parameter
+ * index (DT1 to 00 08 20 <sysexIdx>). Several params share an NVRAM byte
+ * (offset 12 packs reverb/chorus type + velocity switch; offset 24 packs
+ * bend-up/portamento/key-assign/solo-legato; offset 25 packs porta time +
+ * type) — set does read-modify-write to preserve siblings, while each
+ * sub-param has its OWN SysEx address so the firmware unpacks it.
+ * Offsets/indices verified against jv880_juce dataStructures.h and the
+ * existing 8 params (whose SysEx indices match this table exactly). */
+typedef struct {
+    const char *name;
+    int sysexIdx;     /* 4th DT1 address byte under 00 08 20 */
+    int nvramOffset;  /* byte offset within the patch */
+    int shift;        /* bit shift within that byte */
+    int width;        /* value bit width */
+    int minv, maxv;
+} PatchCommonParam;
+
+static const PatchCommonParam PATCH_COMMON_PARAMS[] = {
+    /* name,                sysex, off, sh, w, min, max */
+    {"reverbtype",          0x0D,  12,  0,  4,  0,   7},
+    {"chorustype",          0x11,  12,  4,  2,  0,   2},
+    {"velocityswitch",      0x0C,  12,  7,  1,  0,   1},
+    {"reverblevel",         0x0E,  13,  0,  7,  0, 127},
+    {"reverbtime",          0x0F,  14,  0,  7,  0, 127},
+    {"reverbfeedback",      0x10,  15,  0,  7,  0, 127},
+    {"choruslevel",         0x12,  16,  0,  7,  0, 127},
+    {"chorusoutput",        0x16,  16,  7,  1,  0,   1},
+    {"chorusdepth",         0x13,  17,  0,  7,  0, 127},
+    {"chorusrate",          0x14,  18,  0,  7,  0, 127},
+    {"chorusfeedback",      0x15,  19,  0,  7,  0, 127},
+    {"analogfeel",          0x17,  20,  0,  7,  0, 127},
+    {"patchlevel",          0x18,  21,  0,  7,  0, 127},
+    {"patchpan",            0x19,  22,  0,  7,  0, 127},
+    {"bendrangedown",       0x1A,  23,  0,  7,  0,  48},
+    {"bendrangeup",         0x1B,  24,  0,  4,  0,  12},
+    {"portamentomode",      0x1F,  24,  4,  1,  0,   1},
+    {"sololegato",          0x1D,  24,  5,  1,  0,   1},
+    {"portamentoswitch",    0x1E,  24,  6,  1,  0,   1},
+    {"keyassign",           0x1C,  24,  7,  1,  0,   1},
+    {"portamentotime",      0x21,  25,  0,  7,  0, 127},
+    {"portamentotype",      0x20,  25,  7,  1,  0,   1},
+};
+#define NUM_PATCH_COMMON_PARAMS (sizeof(PATCH_COMMON_PARAMS)/sizeof(PATCH_COMMON_PARAMS[0]))
+
+static const PatchCommonParam* find_patch_common_param(const char *name) {
+    for (size_t i = 0; i < NUM_PATCH_COMMON_PARAMS; i++)
+        if (strcmp(PATCH_COMMON_PARAMS[i].name, name) == 0) return &PATCH_COMMON_PARAMS[i];
+    return NULL;
+}
+
+/* ---- Per-tone control matrix (Mod/Aftertouch/Expression -> 4 dests) ----
+ * JV-880 has, per tone, three controller sources (Modulation/CC1, Aftertouch,
+ * Expression/CC11), each routing to 4 destination slots (A..D) with a signed
+ * sensitivity. In NVRAM the 4 destinations are packed two-per-byte (DestAB:
+ * low nibble=A, high=B; DestCD: low=C, high=D); the 4 sensitivities are
+ * separate signed int8 bytes (center 0). On the SysEx wire each slot has its
+ * OWN dest + sens address (interleaved), and sensitivity is sent +64.
+ *   dest value: 0=Off 1=Pitch 2=Cutoff 3=Resonance 4=Level 5/6=LFO1/2->Pitch
+ *               7/8=LFO1/2->TVF 9/10=LFO1/2->TVA 11/12=LFO1/2 Rate
+ * Kept OUT of the binary-searched TONE_PARAMS table (separate linear lookup)
+ * and handled in the tone get/set paths. Tone-relative offsets 5..22, SysEx
+ * indices from jv880_juce EditToneTab.cpp. */
+typedef struct {
+    const char *name;
+    int off;       /* tone-relative NVRAM byte offset */
+    int shift;     /* nibble shift for dest (0 or 4); ignored for sens */
+    int width;     /* bit width for dest (4); ignored for sens */
+    int sysexIdx;  /* tone-area SysEx param index */
+    int isSens;    /* 1 = signed sensitivity byte; 0 = nibble-packed dest */
+} MatrixParam;
+
+static const MatrixParam MATRIX_PARAMS[] = {
+    /* name,      off, sh, w, sysex, sens */
+    {"moddesta",   5, 0, 4, 0x0A, 0}, {"moddestb",  5, 4, 4, 0x0C, 0},
+    {"moddestc",   6, 0, 4, 0x0E, 0}, {"moddestd",  6, 4, 4, 0x10, 0},
+    {"modsensa",   7, 0, 0, 0x0B, 1}, {"modsensb",  8, 0, 0, 0x0D, 1},
+    {"modsensc",   9, 0, 0, 0x0F, 1}, {"modsensd", 10, 0, 0, 0x11, 1},
+    {"aftdesta",  11, 0, 4, 0x12, 0}, {"aftdestb", 11, 4, 4, 0x14, 0},
+    {"aftdestc",  12, 0, 4, 0x16, 0}, {"aftdestd", 12, 4, 4, 0x18, 0},
+    {"aftsensa",  13, 0, 0, 0x13, 1}, {"aftsensb", 14, 0, 0, 0x15, 1},
+    {"aftsensc",  15, 0, 0, 0x17, 1}, {"aftsensd", 16, 0, 0, 0x19, 1},
+    {"expdesta",  17, 0, 4, 0x1A, 0}, {"expdestb", 17, 4, 4, 0x1C, 0},
+    {"expdestc",  18, 0, 4, 0x1E, 0}, {"expdestd", 18, 4, 4, 0x20, 0},
+    {"expsensa",  19, 0, 0, 0x1B, 1}, {"expsensb", 20, 0, 0, 0x1D, 1},
+    {"expsensc",  21, 0, 0, 0x1F, 1}, {"expsensd", 22, 0, 0, 0x21, 1},
+};
+#define NUM_MATRIX_PARAMS (sizeof(MATRIX_PARAMS)/sizeof(MATRIX_PARAMS[0]))
+
+static const MatrixParam* find_matrix_param(const char *name) {
+    for (size_t i = 0; i < NUM_MATRIX_PARAMS; i++)
+        if (strcmp(MATRIX_PARAMS[i].name, name) == 0) return &MATRIX_PARAMS[i];
+    return NULL;
+}
+
+/* ========================================================================
  * SHARED HELPER FUNCTIONS
  * ======================================================================== */
 
@@ -516,13 +675,23 @@ typedef struct {
     int render_count;
     int min_buffer_level;
 
-    /* Macro offsets (relative, applied across all 4 tones) */
+    /* Macro behavior selector (absolute-anchored vs relative-reset).
+     * Runtime-switchable via set_param("macro_mode", "absolute"|"relative"). */
+    macro_mode_t macro_mode;
+
+    /* Macro offsets (used only in MACRO_RELATIVE_RESET mode; applied across all 4 tones) */
     int macro_cutoff;        /* offset for cutofffrequency */
     int macro_resonance;     /* offset for resonance */
     int macro_attack;        /* offset for tvaenvtime1 */
     int macro_decay;         /* offset for tvaenvtime2 */
     int macro_release;       /* offset for tvaenvtime4 */
     int macro_tvf_env_depth; /* offset for tvfenvdepth */
+    int macro_sustain;       /* offset for tvaenvlevel3 */
+    int macro_lfo_depth;     /* offset for lfo1tvfdepth */
+
+    /* Subtractive link mode: when set, Tone 1 drives every shared (non-oscillator)
+     * param across all four tones. Transient editing mode — reset on patch change. */
+    int link_tones;
 
 #if JV880_PERF_STATS
     /* Per-window accumulators (reset every 15-second report window) */
@@ -564,6 +733,8 @@ static void v2_select_performance(jv880_instance_t *inst, int perf_index);
 static void v2_set_mode(jv880_instance_t *inst, int performance_mode);
 static void v2_send_all_notes_off(jv880_instance_t *inst);
 static void v2_set_param(void *instance, const char *key, const char *val);
+static int v2_get_param(void *instance, const char *key, char *buf, int buf_len);
+static void v2_snap_link_tones(jv880_instance_t *inst);
 
 /* v2: Get file size helper */
 static uint32_t v2_get_file_size(const char *path) {
@@ -1024,6 +1195,13 @@ static void v2_select_patch(jv880_instance_t *inst, int global_index) {
     inst->macro_decay = 0;
     inst->macro_release = 0;
     inst->macro_tvf_env_depth = 0;
+    inst->macro_sustain = 0;
+    inst->macro_lfo_depth = 0;
+
+    /* Subtractive link is an editing overlay on the live patch; a freshly loaded
+     * patch must arrive intact, so always drop link on patch change (decision:
+     * auto-disable, don't overwrite the new patch's per-tone data). */
+    inst->link_tones = 0;
 
     jv_debug("[v2_select_patch] Complete\n");
 }
@@ -1293,6 +1471,9 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     for (int i = 0; i < 8; i++) {
         inst->part_patchbank[i] = -1;
     }
+
+    /* Macro semantics default (calloc already zeroes this; set explicitly for clarity) */
+    inst->macro_mode = MACRO_MODE_DEFAULT;
 
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
     fprintf(stderr, "JV880 v2: Loading from %s\n", module_dir);
@@ -1839,6 +2020,118 @@ static void v2_apply_macro(jv880_instance_t *inst, const char *tone_param_name, 
     }
 }
 
+/* v2: Read a TP_BYTE tone param's stored display value from NVRAM.
+ * Returns the signed (signed_param==1) or unsigned (else) value as displayed.
+ * Used by macro_read and by absolute macro_write to compute per-tone deltas. */
+static int v2_read_tone_byte_param(jv880_instance_t *inst, int toneIdx,
+                                   const ToneParamEntry *p) {
+    int toneBase = NVRAM_PATCH_OFFSET + 26 + (toneIdx * 84);
+    uint8_t raw = inst->mcu->nvram[toneBase + p->nvram_offset];
+    if (p->signed_param == 1) return (int)(int8_t)raw;
+    return (int)raw;
+}
+
+/* v2: Write a single TP_BYTE tone param (NVRAM + DT1 SysEx) given a display
+ * value, mirroring the TP_BYTE branch in v2_set_param. Reuses v2_queue_tone_sysex
+ * so no SysEx building is duplicated. Handles unsigned (0..127) and
+ * signed_param==1 (-63..63, +64 SysEx offset). Macros only touch such params. */
+static void v2_write_tone_byte_param(jv880_instance_t *inst, int toneIdx,
+                                     const ToneParamEntry *p, int value) {
+    int toneBase = NVRAM_PATCH_OFFSET + 26 + (toneIdx * 84);
+    uint8_t *b = &inst->mcu->nvram[toneBase + p->nvram_offset];
+    if (p->signed_param == 1) {
+        int v = clamp_int(value, -63, 63);
+        *b = (uint8_t)(int8_t)v;
+        v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v + 64, p->two_byte);
+    } else {
+        int v = clamp_int(value, 0, 127);
+        *b = (uint8_t)v;
+        v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
+    }
+}
+
+/* v2: True if a tone's toneswitch bit is set (tone enabled).
+ * toneswitch lives at nvram_offset 0, bit 7 of the tone block. */
+static int v2_tone_enabled(jv880_instance_t *inst, int toneIdx) {
+    const ToneParamEntry *sw = find_tone_param("toneswitch");
+    if (!sw) return 1;
+    int toneBase = NVRAM_PATCH_OFFSET + 26 + (toneIdx * 84);
+    uint8_t raw = inst->mcu->nvram[toneBase + sw->nvram_offset];
+    return (raw & (1 << sw->bit_shift)) ? 1 : 0;
+}
+
+/* v2: Anchor tone = lowest-numbered enabled tone, else tone 0. */
+static int v2_macro_anchor_tone(jv880_instance_t *inst) {
+    for (int t = 0; t < 4; t++) {
+        if (v2_tone_enabled(inst, t)) return t;
+    }
+    return 0;
+}
+
+/* Accessor for the per-macro relative offset store (RELATIVE_RESET mode). */
+static int* v2_macro_offset_slot(jv880_instance_t *inst, const macro_def_t *m) {
+    if (strcmp(m->key, "cutoff") == 0)        return &inst->macro_cutoff;
+    if (strcmp(m->key, "resonance") == 0)     return &inst->macro_resonance;
+    if (strcmp(m->key, "attack") == 0)        return &inst->macro_attack;
+    if (strcmp(m->key, "decay") == 0)         return &inst->macro_decay;
+    if (strcmp(m->key, "release") == 0)       return &inst->macro_release;
+    if (strcmp(m->key, "tvf_env_depth") == 0) return &inst->macro_tvf_env_depth;
+    if (strcmp(m->key, "sustain") == 0)       return &inst->macro_sustain;
+    if (strcmp(m->key, "lfo_depth") == 0)     return &inst->macro_lfo_depth;
+    return NULL;
+}
+
+/* ========================================================================
+ * THE MACRO FUNNEL: macro_read / macro_write
+ * Every macro get_param routes through macro_read; every macro set_param
+ * routes through macro_write. Behavior branches solely on inst->macro_mode.
+ * ======================================================================== */
+
+/* macro_read: returns the value to display on the knob.
+ *   ABSOLUTE_ANCHORED -> anchor tone's stored value.
+ *   RELATIVE_RESET    -> the current stored offset for this macro. */
+static int macro_read(jv880_instance_t *inst, const macro_def_t *m) {
+    if (!inst || !inst->mcu || !m) return 0;
+    if (inst->macro_mode == MACRO_RELATIVE_RESET) {
+        int *slot = v2_macro_offset_slot(inst, m);
+        return slot ? *slot : 0;
+    }
+    /* ABSOLUTE_ANCHORED */
+    const ToneParamEntry *p = find_tone_param(m->tone_param);
+    if (!p) return 0;
+    return v2_read_tone_byte_param(inst, v2_macro_anchor_tone(inst), p);
+}
+
+/* macro_write: applies the macro semantics for the given display value.
+ *   ABSOLUTE_ANCHORED -> delta = value - anchor_value; for every enabled tone
+ *       write clamp(tone_value + delta, min, max) via the normal nvram+SysEx path.
+ *   RELATIVE_RESET    -> store offset and apply it non-destructively (legacy). */
+static void macro_write(jv880_instance_t *inst, const macro_def_t *m, int value) {
+    if (!inst || !inst->mcu || !m) return;
+
+    if (inst->macro_mode == MACRO_RELATIVE_RESET) {
+        int *slot = v2_macro_offset_slot(inst, m);
+        int offset = clamp_int(value, -64, 63);
+        if (slot) *slot = offset;
+        v2_apply_macro(inst, m->tone_param, offset);
+        return;
+    }
+
+    /* ABSOLUTE_ANCHORED */
+    const ToneParamEntry *p = find_tone_param(m->tone_param);
+    if (!p) return;
+    int target = clamp_int(value, m->min, m->max);
+    int anchor = v2_macro_anchor_tone(inst);
+    int anchor_value = v2_read_tone_byte_param(inst, anchor, p);
+    int delta = target - anchor_value;
+    for (int t = 0; t < 4; t++) {
+        if (!v2_tone_enabled(inst, t)) continue;
+        int cur = v2_read_tone_byte_param(inst, t, p);
+        int nv = clamp_int(cur + delta, m->min, m->max);
+        v2_write_tone_byte_param(inst, t, p, nv);
+    }
+}
+
 /* v2: Helper to queue SysEx for part parameter changes
  * two_byte: if true, sends MSB/LSB format (for 0-255 range params like patchnumber)
  *           MSB = (value >> 7) & 0x7F, LSB = value & 0x7F
@@ -1913,8 +2206,24 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) 
     memcpy(inst->midi_queue[write_idx], msg, len);
     inst->midi_queue_len[write_idx] = len;
 
-    /* Apply octave transpose to note on/off */
     uint8_t status = inst->midi_queue[write_idx][0] & 0xF0;
+
+    /* Poly -> channel aftertouch translation.
+     * The Move's pads emit polyphonic (per-note) aftertouch (0xA0 note pressure),
+     * but the JV-880 only responds to channel aftertouch (0xD0 pressure) for its
+     * AFT controller-matrix source — so pad pressure was being ignored. Rewrite
+     * each poly-AT message into a channel-AT message carrying the same pressure.
+     * Per-note pressure collapses to the latest note's value, which is correct
+     * for the JV's single channel-wide aftertouch source. */
+    if (status == 0xA0 && len >= 3) {
+        uint8_t ch = inst->midi_queue[write_idx][0] & 0x0F;
+        inst->midi_queue[write_idx][0] = 0xD0 | ch;
+        inst->midi_queue[write_idx][1] = inst->midi_queue[write_idx][2]; /* pressure */
+        inst->midi_queue_len[write_idx] = 2;
+        status = 0xD0;
+    }
+
+    /* Apply octave transpose to note on/off */
     if ((status == 0x90 || status == 0x80) && len >= 2) {
         int note = inst->midi_queue[write_idx][1] + (inst->octave_transpose * 12);
         if (note < 0) note = 0;
@@ -2126,6 +2435,122 @@ static int json_get_number(const char *json, const char *key, float *out) {
 }
 
 /* v2: Set parameter - full expansion support */
+/* Subtractive link mode: which per-tone params stay independent (the
+ * "oscillator" — wave, tuning, output level/pan) vs. shared (filter, amp env,
+ * LFOs, pitch env, control matrix, sends) and driven by Tone 1. Anything not in
+ * the per-tone list is treated as shared, so new params default to shared. */
+static int v2_is_shared_tone_param(const char *name) {
+    static const char *PER_TONE[] = {
+        "wavegroup", "wavenumber", "fxmswitch", "fxmdepth", "toneswitch",
+        "pitchcoarse", "pitchfine", "randompitchdepth", "pitchkeyfollow",
+        "level", "pan", "levelkeyfollow", "panningkeyfollow"
+    };
+    for (size_t i = 0; i < sizeof(PER_TONE)/sizeof(PER_TONE[0]); i++)
+        if (strcmp(name, PER_TONE[i]) == 0) return 0;
+    return 1;
+}
+
+/* Write one tone param (NVRAM + DT1 SysEx) for a single tone. Extracted from the
+ * nvram_tone_* set branch so link mode can fan the same write across all 4 tones.
+ * Handles the per-tone control matrix and every ToneParamEntry type. */
+static void v2_write_one_tone_param(jv880_instance_t *inst, int toneIdx,
+                                    const char *paramName, const char *val) {
+    if (!inst || !inst->mcu || toneIdx < 0 || toneIdx > 3) return;
+    const int toneBase = NVRAM_PATCH_OFFSET + 26 + (toneIdx * 84);
+
+    const MatrixParam *mx = find_matrix_param(paramName);
+    if (mx) {
+        uint8_t *mb = &inst->mcu->nvram[toneBase + mx->off];
+        if (mx->isSens) {
+            int sv = clamp_int(atoi(val), -63, 63);
+            *mb = (uint8_t)(int8_t)sv;
+            v2_queue_tone_sysex(inst, toneIdx, mx->sysexIdx, sv + 64, 0);
+        } else {
+            int dv = clamp_int(atoi(val), 0, 12);
+            int dmask = ((1 << mx->width) - 1) << mx->shift;
+            *mb = (uint8_t)((*mb & ~dmask) | ((dv << mx->shift) & dmask));
+            v2_queue_tone_sysex(inst, toneIdx, mx->sysexIdx, dv, 0);
+        }
+        return;
+    }
+
+    const ToneParamEntry *p = find_tone_param(paramName);
+    if (!p) return;
+    uint8_t *b = &inst->mcu->nvram[toneBase + p->nvram_offset];
+    int v, sysex_val;
+    switch (p->type) {
+        case TP_BYTE:
+            if (p->signed_param == 1) {
+                v = clamp_int(atoi(val), -63, 63);
+                *b = (uint8_t)(int8_t)v; sysex_val = v + 64;
+                v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, sysex_val, p->two_byte);
+            } else if (p->signed_param == 2) {
+                v = clamp_int(atoi(val), -64, 63); sysex_val = v + 64;
+                *b = (uint8_t)sysex_val;
+                v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, sysex_val, p->two_byte);
+            } else {
+                v = clamp_int(atoi(val), 0, 127); *b = (uint8_t)v;
+                v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
+            }
+            return;
+        case TP_BITFIELD:
+            v = clamp_int(atoi(val), 0, p->bit_mask);
+            *b = (*b & ~(p->bit_mask << p->bit_shift)) | ((v & p->bit_mask) << p->bit_shift);
+            if (strcmp(paramName, "fxmdepth") == 0 && v > 0)
+                v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v - 1, p->two_byte);
+            else
+                v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
+            return;
+        case TP_BOOL:
+            v = (strcmp(val, "On") == 0 || atoi(val)) ? 1 : 0;
+            if (v) *b |= (1 << p->bit_shift); else *b &= ~(1 << p->bit_shift);
+            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
+            return;
+        case TP_ENUM:
+            if (strcmp(paramName, "filtermode") == 0) {
+                if (strcmp(val, "Off") == 0) v = 0;
+                else if (strcmp(val, "LPF") == 0) v = 1;
+                else if (strcmp(val, "HPF") == 0) v = 2;
+                else v = clamp_int(atoi(val), 0, 2);
+                *b = (*b & ~(p->bit_mask << p->bit_shift)) | ((v & p->bit_mask) << p->bit_shift);
+                v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
+                return;
+            }
+            if (strcmp(paramName, "resonancemode") == 0) {
+                v = (strcmp(val, "Hard") == 0 || atoi(val)) ? 1 : 0;
+                if (v) *b |= 0x80; else *b &= ~0x80;
+                v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
+                return;
+            }
+            v = clamp_int(atoi(val), 0, p->bit_mask);
+            *b = (*b & ~(p->bit_mask << p->bit_shift)) | ((v & p->bit_mask) << p->bit_shift);
+            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
+            return;
+    }
+}
+
+/* Snap: copy every shared tone param from Tone 1 (idx 0) to tones 2-4 so the
+ * four tones immediately share one filter/amp/LFO/matrix shape. Round-trips each
+ * value as a string through get/write (all shared params read back as plain
+ * numerics that the writer accepts), so it stays correct across param types. */
+static void v2_snap_link_tones(jv880_instance_t *inst) {
+    if (!inst || !inst->mcu) return;
+    char k[48], tmp[48];
+    for (size_t i = 0; i < NUM_TONE_PARAMS; i++) {
+        const char *nm = TONE_PARAMS[i].name;
+        if (!v2_is_shared_tone_param(nm)) continue;
+        snprintf(k, sizeof(k), "nvram_tone_0_%s", nm);
+        if (v2_get_param(inst, k, tmp, sizeof(tmp)) <= 0) continue;
+        for (int t = 1; t < 4; t++) v2_write_one_tone_param(inst, t, nm, tmp);
+    }
+    for (size_t i = 0; i < NUM_MATRIX_PARAMS; i++) {
+        const char *nm = MATRIX_PARAMS[i].name;  /* all matrix params are shared */
+        snprintf(k, sizeof(k), "nvram_tone_0_%s", nm);
+        if (v2_get_param(inst, k, tmp, sizeof(tmp)) <= 0) continue;
+        for (int t = 1; t < 4; t++) v2_write_one_tone_param(inst, t, nm, tmp);
+    }
+}
+
 static void v2_set_param(void *instance, const char *key, const char *val) {
     jv880_instance_t *inst = (jv880_instance_t*)instance;
     if (!inst) return;
@@ -2152,6 +2577,11 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
          * to skip loading the actual ROM data. */
         if (json_get_number(val, "expansion_bank_offset", &f) == 0) {
             inst->expansion_bank_offset = (int)f;
+        }
+        /* Restore macro semantics mode (absent in v1 state -> keep default). */
+        if (json_get_number(val, "macro_mode", &f) == 0) {
+            inst->macro_mode = ((int)f == MACRO_RELATIVE_RESET)
+                ? MACRO_RELATIVE_RESET : MACRO_ABSOLUTE_ANCHORED;
         }
         /* Restore preset or performance based on mode */
         if (inst->performance_mode) {
@@ -2327,130 +2757,49 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
         v2_select_patch(inst, 0);
         fprintf(stderr, "JV880 v2: Jumped to internal patches\n");
     } else if (strncmp(key, "nvram_patchCommon_", 18) == 0 && inst->mcu) {
-        const char *paramName = key + 18;
-        int sysexIdx = -1;
-        int nvramOffset = -1;
-
-        /* Map parameter names to both SysEx index and NVRAM offset */
-        if (strcmp(paramName, "reverblevel") == 0) { sysexIdx = 14; nvramOffset = 13; }
-        else if (strcmp(paramName, "reverbtime") == 0) { sysexIdx = 15; nvramOffset = 14; }
-        else if (strcmp(paramName, "choruslevel") == 0) { sysexIdx = 18; nvramOffset = 16; }
-        else if (strcmp(paramName, "chorusdepth") == 0) { sysexIdx = 19; nvramOffset = 17; }
-        else if (strcmp(paramName, "chorusrate") == 0) { sysexIdx = 20; nvramOffset = 18; }
-        else if (strcmp(paramName, "analogfeel") == 0) { sysexIdx = 23; nvramOffset = 20; }
-        else if (strcmp(paramName, "patchlevel") == 0) { sysexIdx = 0x18; nvramOffset = 21; }  /* 18h per MIDI Impl */
-        else if (strcmp(paramName, "patchpan") == 0) { sysexIdx = 0x19; nvramOffset = 22; }   /* 19h per MIDI Impl */
-
-        if (sysexIdx >= 0 && nvramOffset >= 0) {
-            const int v = clamp_int(atoi(val), 0, 127);
-            /* Update NVRAM directly for immediate UI feedback */
-            inst->mcu->nvram[NVRAM_PATCH_OFFSET + nvramOffset] = (uint8_t)v;
-            /* Send SysEx to emulator for actual sound change */
-            v2_queue_patch_common_sysex(inst, sysexIdx, v);
+        const PatchCommonParam *pc = find_patch_common_param(key + 18);
+        if (pc) {
+            int v = clamp_int(atoi(val), pc->minv, pc->maxv);
+            int mask = ((1 << pc->width) - 1) << pc->shift;
+            /* Read-modify-write the NVRAM byte (preserves sibling bitfields)
+             * for immediate readback; send the sub-value to its own SysEx
+             * address so the emulator applies the sound change. */
+            uint8_t *b = &inst->mcu->nvram[NVRAM_PATCH_OFFSET + pc->nvramOffset];
+            *b = (uint8_t)((*b & ~mask) | ((v << pc->shift) & mask));
+            v2_queue_patch_common_sysex(inst, pc->sysexIdx, v);
         }
     } else if (strncmp(key, "nvram_tone_", 11) == 0 && inst->mcu) {
-        /* Optimized tone param set using binary search lookup */
         int toneIdx = atoi(key + 11);
         const char *underscore = strchr(key + 11, '_');
         if (underscore && toneIdx >= 0 && toneIdx < 4) {
             const char *paramName = underscore + 1;
-            const int toneBase = NVRAM_PATCH_OFFSET + 26 + (toneIdx * 84);
-
-            const ToneParamEntry *p = find_tone_param(paramName);
-            if (p) {
-                uint8_t *b = &inst->mcu->nvram[toneBase + p->nvram_offset];
-                int v;
-                int sysex_val;
-
-                switch (p->type) {
-                    case TP_BYTE:
-                        if (p->signed_param == 1) {
-                            /* Signed param: accept negative values, add 64 for SysEx */
-                            v = clamp_int(atoi(val), -63, 63);
-                            *b = (uint8_t)(int8_t)v;  /* Store as signed byte */
-                            sysex_val = v + 64;      /* Add offset for SysEx */
-                            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, sysex_val, p->two_byte);
-                        } else if (p->signed_param == 2) {
-                            /* Pan special case: stored with +64 offset */
-                            v = clamp_int(atoi(val), -64, 63);
-                            sysex_val = v + 64;      /* -64 to +63 becomes 0 to 127 */
-                            *b = (uint8_t)sysex_val; /* Store with offset */
-                            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, sysex_val, p->two_byte);
-                        } else {
-                            /* Unsigned param */
-                            v = clamp_int(atoi(val), 0, 127);
-                            *b = (uint8_t)v;
-                            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
-                        }
-                        return;
-
-                    case TP_BITFIELD:
-                        v = clamp_int(atoi(val), 0, p->bit_mask);
-                        *b = (*b & ~(p->bit_mask << p->bit_shift)) | ((v & p->bit_mask) << p->bit_shift);
-                        /* FXM depth special case: SysEx wants value-1 (1-16 becomes 0-15) */
-                        if (strcmp(paramName, "fxmdepth") == 0 && v > 0) {
-                            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v - 1, p->two_byte);
-                        } else {
-                            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
-                        }
-                        return;
-
-                    case TP_BOOL:
-                        v = (strcmp(val, "On") == 0 || atoi(val)) ? 1 : 0;
-                        if (v) *b |= (1 << p->bit_shift);
-                        else *b &= ~(1 << p->bit_shift);
-                        v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
-                        return;
-
-                    case TP_ENUM:
-                        /* Special handling for specific enums */
-                        if (strcmp(paramName, "filtermode") == 0) {
-                            if (strcmp(val, "Off") == 0) v = 0;
-                            else if (strcmp(val, "LPF") == 0) v = 1;
-                            else if (strcmp(val, "HPF") == 0) v = 2;
-                            else v = clamp_int(atoi(val), 0, 2);
-                            *b = (*b & ~(p->bit_mask << p->bit_shift)) | ((v & p->bit_mask) << p->bit_shift);
-                            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
-                            return;
-                        }
-                        if (strcmp(paramName, "resonancemode") == 0) {
-                            v = (strcmp(val, "Hard") == 0 || atoi(val)) ? 1 : 0;
-                            if (v) *b |= 0x80; else *b &= ~0x80;
-                            v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
-                            return;
-                        }
-                        /* Default enum handling */
-                        v = clamp_int(atoi(val), 0, p->bit_mask);
-                        *b = (*b & ~(p->bit_mask << p->bit_shift)) | ((v & p->bit_mask) << p->bit_shift);
-                        v2_queue_tone_sysex(inst, toneIdx, p->sysex_idx, v, p->two_byte);
-                        return;
-                }
+            if (inst->link_tones && v2_is_shared_tone_param(paramName)) {
+                /* Subtractive link: a shared param drives all four tones at once
+                 * (Tone 1 is the master, but editing any tone's shared control
+                 * fans out identically since the tones are kept equal). */
+                for (int t = 0; t < 4; t++) v2_write_one_tone_param(inst, t, paramName, val);
+            } else {
+                v2_write_one_tone_param(inst, toneIdx, paramName, val);
             }
         }
-    } else if (strncmp(key, "macro_", 6) == 0 && inst->mcu) {
-        /* Macro controls: virtual params that offset all 4 tones simultaneously */
-        const char *macroName = key + 6;
-        int offset = clamp_int(atoi(val), -64, 63);
-
-        if (strcmp(macroName, "cutoff") == 0) {
-            inst->macro_cutoff = offset;
-            v2_apply_macro(inst, "cutofffrequency", offset);
-        } else if (strcmp(macroName, "resonance") == 0) {
-            inst->macro_resonance = offset;
-            v2_apply_macro(inst, "resonance", offset);
-        } else if (strcmp(macroName, "attack") == 0) {
-            inst->macro_attack = offset;
-            v2_apply_macro(inst, "tvaenvtime1", offset);
-        } else if (strcmp(macroName, "decay") == 0) {
-            inst->macro_decay = offset;
-            v2_apply_macro(inst, "tvaenvtime2", offset);
-        } else if (strcmp(macroName, "release") == 0) {
-            inst->macro_release = offset;
-            v2_apply_macro(inst, "tvaenvtime4", offset);
-        } else if (strcmp(macroName, "tvf_env_depth") == 0) {
-            inst->macro_tvf_env_depth = offset;
-            v2_apply_macro(inst, "tvfenvdepth", offset);
+    } else if (strcmp(key, "link_tones") == 0) {
+        /* Subtractive mode toggle. On enable, snap Tone 1's shared params onto
+         * tones 2-4 so they immediately behave as one voice. */
+        int on = (strcmp(val, "On") == 0 || atoi(val)) ? 1 : 0;
+        int was = inst->link_tones;
+        inst->link_tones = on;
+        if (on && !was) v2_snap_link_tones(inst);
+    } else if (strcmp(key, "macro_mode") == 0) {
+        /* Runtime A/B switch for macro semantics (not surfaced in UI). */
+        if (strcmp(val, "relative") == 0 || strcmp(val, "MACRO_RELATIVE_RESET") == 0) {
+            inst->macro_mode = MACRO_RELATIVE_RESET;
+        } else {
+            inst->macro_mode = MACRO_ABSOLUTE_ANCHORED;
         }
+    } else if (strncmp(key, "macro_", 6) == 0 && inst->mcu) {
+        /* All macro behavior funnels through macro_write; semantics branch on mode. */
+        const macro_def_t *m = find_macro(key + 6);
+        if (m) macro_write(inst, m, atoi(val));
     } else if (strncmp(key, "sram_part_", 10) == 0 && inst->mcu) {
         int partIdx = key[10] - '0';
         if (partIdx >= 0 && partIdx < 8 && key[11] == '_') {
@@ -2923,6 +3272,14 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 tone_cache_valid = now;
             }
 
+            /* Per-tone control matrix (dest nibble / signed sensitivity). */
+            const MatrixParam *mx = find_matrix_param(paramName);
+            if (mx) {
+                uint8_t mbyte = tone_cache[(toneIdx * 84) + mx->off];
+                if (mx->isSens) return snprintf(buf, buf_len, "%d", (int)(int8_t)mbyte);
+                return snprintf(buf, buf_len, "%d", (mbyte >> mx->shift) & ((1 << mx->width) - 1));
+            }
+
             const ToneParamEntry *p = find_tone_param(paramName);
             if (p) {
                 int cacheOffset = (toneIdx * 84) + p->nvram_offset;
@@ -2945,16 +3302,15 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                         }
                         return snprintf(buf, buf_len, "%d", (byte >> p->bit_shift) & p->bit_mask);
                     case TP_BOOL:
-                        return snprintf(buf, buf_len, "%s", (byte & (1 << p->bit_shift)) ? "On" : "Off");
+                        /* Return numeric index (0/1); the UI maps it to an enum
+                         * label via the chain_params "options" array. SET still
+                         * accepts both "On"/"Off" and numeric, so this is safe. */
+                        return snprintf(buf, buf_len, "%d", (byte & (1 << p->bit_shift)) ? 1 : 0);
                     case TP_ENUM:
-                        /* Special handling for filtermode and resonancemode */
-                        if (strcmp(paramName, "filtermode") == 0) {
-                            int v = (byte >> p->bit_shift) & p->bit_mask;
-                            const char *labels[] = {"Off", "LPF", "HPF"};
-                            return snprintf(buf, buf_len, "%s", labels[v < 3 ? v : 0]);
-                        }
+                        /* Return numeric index; UI formats via chain_params options.
+                         * resonancemode is a single 0x80 bit, others use mask. */
                         if (strcmp(paramName, "resonancemode") == 0) {
-                            return snprintf(buf, buf_len, "%s", (byte & 0x80) ? "Hard" : "Soft");
+                            return snprintf(buf, buf_len, "%d", (byte & 0x80) ? 1 : 0);
                         }
                         return snprintf(buf, buf_len, "%d", (byte >> p->bit_shift) & p->bit_mask);
                 }
@@ -2999,16 +3355,9 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                 /* Get current value of mapped parameter */
                 const char *pkey = keys[idx];
                 if (strncmp(pkey, "macro_", 6) == 0) {
-                    /* Macro params: return offset value */
-                    const char *mn = pkey + 6;
-                    int val = 0;
-                    if (strcmp(mn, "cutoff") == 0) val = inst->macro_cutoff;
-                    else if (strcmp(mn, "resonance") == 0) val = inst->macro_resonance;
-                    else if (strcmp(mn, "attack") == 0) val = inst->macro_attack;
-                    else if (strcmp(mn, "decay") == 0) val = inst->macro_decay;
-                    else if (strcmp(mn, "release") == 0) val = inst->macro_release;
-                    else if (strcmp(mn, "tvf_env_depth") == 0) val = inst->macro_tvf_env_depth;
-                    return snprintf(buf, buf_len, "%d", val);
+                    /* Macro params: current display value (mode-dependent). */
+                    const macro_def_t *m = find_macro(pkey + 6);
+                    return snprintf(buf, buf_len, "%d", m ? macro_read(inst, m) : 0);
                 } else {
                     /* Forward to normal get_param for nvram/sram params */
                     return v2_get_param(instance, pkey, buf, buf_len);
@@ -3018,18 +3367,17 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         return -1;
     }
 
-    /* Macro params: return current offset value */
+    /* Macro mode (A/B selector, readable). */
+    if (strcmp(key, "macro_mode") == 0) {
+        return snprintf(buf, buf_len, "%s",
+            inst->macro_mode == MACRO_RELATIVE_RESET ? "relative" : "absolute");
+    }
+
+    /* Macro params: current display value (mode-dependent, via the funnel). */
     if (strncmp(key, "macro_", 6) == 0) {
-        const char *macroName = key + 6;
-        int val = 0;
-        if (strcmp(macroName, "cutoff") == 0) val = inst->macro_cutoff;
-        else if (strcmp(macroName, "resonance") == 0) val = inst->macro_resonance;
-        else if (strcmp(macroName, "attack") == 0) val = inst->macro_attack;
-        else if (strcmp(macroName, "decay") == 0) val = inst->macro_decay;
-        else if (strcmp(macroName, "release") == 0) val = inst->macro_release;
-        else if (strcmp(macroName, "tvf_env_depth") == 0) val = inst->macro_tvf_env_depth;
-        else return -1;
-        return snprintf(buf, buf_len, "%d", val);
+        const macro_def_t *m = find_macro(key + 6);
+        if (!m) return -1;
+        return snprintf(buf, buf_len, "%d", macro_read(inst, m));
     }
 
     /* Fast path for sram_part_ params (performance mode editing) */
@@ -3100,22 +3448,13 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         }
     }
 
-    /* Fast path for nvram_patchCommon_ params */
+    /* Fast path for nvram_patchCommon_ params (FX + control section) */
     if (strncmp(key, "nvram_patchCommon_", 18) == 0 && inst->mcu) {
-        const char* paramName = key + 18;
-        int offset = -1;
-
-        if (strcmp(paramName, "patchlevel") == 0) offset = 21;
-        else if (strcmp(paramName, "patchpan") == 0) offset = 22;
-        else if (strcmp(paramName, "reverblevel") == 0) offset = 13;
-        else if (strcmp(paramName, "reverbtime") == 0) offset = 14;
-        else if (strcmp(paramName, "choruslevel") == 0) offset = 16;
-        else if (strcmp(paramName, "chorusdepth") == 0) offset = 17;
-        else if (strcmp(paramName, "chorusrate") == 0) offset = 18;
-        else if (strcmp(paramName, "analogfeel") == 0) offset = 20;
-
-        if (offset >= 0) {
-            return snprintf(buf, buf_len, "%d", inst->mcu->nvram[NVRAM_PATCH_OFFSET + offset]);
+        const PatchCommonParam *pc = find_patch_common_param(key + 18);
+        if (pc) {
+            uint8_t b = inst->mcu->nvram[NVRAM_PATCH_OFFSET + pc->nvramOffset];
+            int v = (b >> pc->shift) & ((1 << pc->width) - 1);
+            return snprintf(buf, buf_len, "%d", v);
         }
     }
 
@@ -3174,18 +3513,23 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     if (strcmp(key, "octave_transpose") == 0) {
         return snprintf(buf, buf_len, "%d", inst->octave_transpose);
     }
+    if (strcmp(key, "link_tones") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->link_tones);
+    }
     /* State serialization for patch save/load */
     if (strcmp(key, "state") == 0) {
         int written = snprintf(buf, buf_len,
-            "{\"mode\":%d,\"preset\":%d,\"performance\":%d,\"part\":%d,\"octave_transpose\":%d,"
-            "\"expansion_index\":%d,\"expansion_bank_offset\":%d",
+            "{\"version\":2,\"mode\":%d,\"preset\":%d,\"performance\":%d,\"part\":%d,\"octave_transpose\":%d,"
+            "\"expansion_index\":%d,\"expansion_bank_offset\":%d,\"macro_mode\":%d,\"link_tones\":%d",
             inst->performance_mode ? 1 : 0,
             inst->current_patch,
             inst->current_performance,
             inst->current_part,
             inst->octave_transpose,
             inst->current_expansion,
-            inst->expansion_bank_offset);
+            inst->expansion_bank_offset,
+            (int)inst->macro_mode,
+            inst->link_tones);
 
         /* Include working patch data as hex if MCU is ready */
         if (inst->mcu && written < buf_len - 800) {
@@ -3195,6 +3539,38 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     inst->mcu->nvram[NVRAM_PATCH_OFFSET + i]);
             }
             written += snprintf(buf + written, buf_len - written, "\"");
+        }
+
+        /* Flat native-int param values so schwung-manager's bulk init path
+         * (sendAllParamsAtOnce, which reads this "state" key) can seed the
+         * graphical remote UI — without these it forwards only the fields
+         * above and every macro/tone/patch-common control inits blank.
+         * Emitted AFTER the authoritative patch hex and behind a hard size
+         * guard (also bounded to the 16KB chain-autosave buffer), so "state"
+         * stays valid JSON and save/restore can never be truncated. The
+         * "state" set parser looks up only named keys, so these are ignored
+         * on restore; values come from this same get_param, so they always
+         * match what the UI controls expect. */
+        if (inst->mcu && inst->loading_complete) {
+            const int SAFE = (buf_len < 15800 ? buf_len : 15800) - 64;
+            char tmp[48], k[48];
+            for (size_t mi = 0; mi < NUM_MACROS && written < SAFE; mi++) {
+                snprintf(k, sizeof(k), "macro_%s", MACRO_DEFS[mi].key);
+                int n = v2_get_param(instance, k, tmp, sizeof(tmp));
+                if (n > 0) written += snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+            }
+            for (size_t pi = 0; pi < NUM_PATCH_COMMON_PARAMS && written < SAFE; pi++) {
+                snprintf(k, sizeof(k), "nvram_patchCommon_%s", PATCH_COMMON_PARAMS[pi].name);
+                int n = v2_get_param(instance, k, tmp, sizeof(tmp));
+                if (n > 0) written += snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+            }
+            for (int t = 0; t < 4 && written < SAFE; t++) {
+                for (size_t ti = 0; ti < sizeof(TONE_PARAMS)/sizeof(TONE_PARAMS[0]) && written < SAFE; ti++) {
+                    snprintf(k, sizeof(k), "nvram_tone_%d_%s", t, TONE_PARAMS[ti].name);
+                    int n = v2_get_param(instance, k, tmp, sizeof(tmp));
+                    if (n > 0) written += snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+                }
+            }
         }
         written += snprintf(buf + written, buf_len - written, "}");
         return written;
@@ -3515,7 +3891,141 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
      * Part params use: sram_part_<n>_<param> (n=0-7)
      */
     if (strcmp(key, "ui_hierarchy") == 0) {
-        const char *hierarchy = "{"
+        /* GROUND TRUTH: In a Signal Chain slot the platform's shadow_ui.js is the
+         * live renderer (not this module's src/ui.js). That renderer keys every
+         * param entry as "synth:<key>" via buildHierarchyParamKey(); it has NO
+         * tone_section/tone_prefix support and DOES NOT carry a child_prefix
+         * context into navigated sub-levels. So per-tone editing MUST use explicit
+         * per-tone levels with fully-qualified nvram_tone_<n>_<param> keys (the
+         * dx7 pattern: operators are written out explicitly, never via a
+         * "selected operator" mechanism). We generate the 4 tones x 7 sections
+         * via a snprintf loop. Phase A root levels (patch/patch_main/
+         * patch_common) and the performance tree are unchanged. */
+
+        /* Per-section param suffix lists (relative to a tone). Each entry is the
+         * bare param suffix; the loop emits {"key":"nvram_tone_<n>_<suffix>",...}.
+         * Labels come from chain_params (name field), so we only need keys here. */
+        struct ToneSecParam { const char *suffix; const char *label; };
+        struct ToneSection {
+            const char *id;       /* sublevel id suffix, e.g. "wave" -> tone1_wave */
+            const char *label;    /* menu label */
+            const struct ToneSecParam *params;
+            int param_count;
+        };
+
+        static const struct ToneSecParam wave_p[] = {
+            {"toneswitch","Tone Switch"},{"wavegroup","Wave Group"},
+            {"wavenumber","Wave Number"},{"fxmswitch","FXM"},{"fxmdepth","FXM Depth"},
+        };
+        /* NOTE: the renderer filters a level's knobs to keys ALSO present in
+         * its params (shadow_ui.js applyHierarchyVisibilityFilters), so each
+         * section's knob row = its FIRST 8 params. Order lists accordingly:
+         * most-tweaked first. */
+        static const struct ToneSecParam pitch_p[] = {
+            {"pitchcoarse","Pitch Coarse"},{"pitchfine","Pitch Fine"},
+            {"penvdepth","P.Env Depth"},
+            {"penvtime1","P.Env T1"},{"penvtime2","P.Env T2"},
+            {"penvtime4","P.Env T4"},
+            {"pitchkeyfollow","Pitch KF"},{"randompitchdepth","Random Pitch"},
+            {"penvtime3","P.Env T3"},
+            {"penvlevel1","P.Env L1"},{"penvlevel2","P.Env L2"},
+            {"penvlevel3","P.Env L3"},{"penvlevel4","P.Env L4"},
+        };
+        static const struct ToneSecParam filter_p[] = {
+            {"cutofffrequency","Cutoff"},{"resonance","Resonance"},
+            {"tvfenvdepth","F.Env Depth"},
+            {"tvfenvtime1","F.Env T1"},{"tvfenvtime2","F.Env T2"},
+            {"tvfenvlevel3","F.Env L3"},{"tvfenvtime4","F.Env T4"},
+            {"filtermode","Filter Mode"},
+            {"cutoffkeyfollow","Cutoff KF"},{"resonancemode","Reso Mode"},
+            {"tvfenvvelocitylevelsense","F.Env Velo"},
+            {"tvfenvtime3","F.Env T3"},
+            {"tvfenvlevel1","F.Env L1"},{"tvfenvlevel2","F.Env L2"},
+            {"tvfenvlevel4","F.Env L4"},
+        };
+        static const struct ToneSecParam amp_p[] = {
+            {"level","Level"},{"pan","Pan"},
+            {"tvaenvtime1","A.Env T1"},{"tvaenvtime2","A.Env T2"},
+            {"tvaenvlevel3","A.Env L3"},{"tvaenvtime4","A.Env T4"},
+            {"tvaenvvelocitylevelsense","A.Env Velo"},{"tvaenvvelocitycurve","A.Env Curve"},
+            {"levelkeyfollow","Level KF"},{"panningkeyfollow","Pan KF"},
+            {"tvaenvtime3","A.Env T3"},
+            {"tvaenvlevel1","A.Env L1"},{"tvaenvlevel2","A.Env L2"},
+            {"tonedelaymode","Delay Mode"},{"tonedelaytime","Delay Time"},
+        };
+        static const struct ToneSecParam lfo1_p[] = {
+            {"lfo1form","LFO1 Wave"},{"lfo1rate","LFO1 Rate"},
+            {"lfo1delay","LFO1 Delay"},{"lfo1fadetime","LFO1 Fade"},
+            {"lfo1pitchdepth","LFO1 Pitch"},{"lfo1tvfdepth","LFO1 Filter"},
+            {"lfo1tvadepth","LFO1 Amp"},{"lfo1offset","LFO1 Offset"},
+            {"lfo1synchro","LFO1 Sync"},
+        };
+        static const struct ToneSecParam lfo2_p[] = {
+            {"lfo2form","LFO2 Wave"},{"lfo2rate","LFO2 Rate"},
+            {"lfo2delay","LFO2 Delay"},{"lfo2fadetime","LFO2 Fade"},
+            {"lfo2pitchdepth","LFO2 Pitch"},{"lfo2tvfdepth","LFO2 Filter"},
+            {"lfo2tvadepth","LFO2 Amp"},
+        };
+        static const struct ToneSecParam fx_p[] = {
+            {"drylevel","Dry Level"},{"reverbsendlevel","Reverb Send"},
+            {"chorussendlevel","Chorus Send"},
+        };
+        /* Control matrix: one page per source, 8 params each (Dest+Sens × 4
+         * slots interleaved so each Dest sits next to its Sens). */
+        static const struct ToneSecParam mod_p[] = {
+            {"moddesta","Mod Dest A"},{"modsensa","Mod Sens A"},
+            {"moddestb","Mod Dest B"},{"modsensb","Mod Sens B"},
+            {"moddestc","Mod Dest C"},{"modsensc","Mod Sens C"},
+            {"moddestd","Mod Dest D"},{"modsensd","Mod Sens D"},
+        };
+        static const struct ToneSecParam aft_p[] = {
+            {"aftdesta","Aft Dest A"},{"aftsensa","Aft Sens A"},
+            {"aftdestb","Aft Dest B"},{"aftsensb","Aft Sens B"},
+            {"aftdestc","Aft Dest C"},{"aftsensc","Aft Sens C"},
+            {"aftdestd","Aft Dest D"},{"aftsensd","Aft Sens D"},
+        };
+        static const struct ToneSecParam exp_p[] = {
+            {"expdesta","Exp Dest A"},{"expsensa","Exp Sens A"},
+            {"expdestb","Exp Dest B"},{"expsensb","Exp Sens B"},
+            {"expdestc","Exp Dest C"},{"expsensc","Exp Sens C"},
+            {"expdestd","Exp Dest D"},{"expsensd","Exp Sens D"},
+        };
+
+        #define TSEC(id,label,arr) { id, label, arr, (int)(sizeof(arr)/sizeof((arr)[0])) }
+        static const struct ToneSection sections[] = {
+            TSEC("wave","Wave",wave_p),
+            TSEC("pitch","Pitch",pitch_p),
+            TSEC("filter","Filter",filter_p),
+            TSEC("amp","Amp",amp_p),
+            TSEC("lfo1","LFO 1",lfo1_p),
+            TSEC("lfo2","LFO 2",lfo2_p),
+            TSEC("fx","FX Sends",fx_p),
+            TSEC("mod","Mod Matrix",mod_p),
+            TSEC("aft","Aftertouch",aft_p),
+            TSEC("exp","Expression",exp_p),
+        };
+        #undef TSEC
+        const int section_count = (int)(sizeof(sections)/sizeof(sections[0]));
+
+        /* The per-tone knob row stays live on every tone sublevel. Knob keys are
+         * fully qualified per tone so the encoders edit the displayed tone. */
+        static const char *knob_suffix[8] = {
+            "cutofffrequency","resonance","tvaenvtime1","tvaenvtime2",
+            "tvaenvlevel3","tvaenvtime4","level","pan"
+        };
+        static const char *knob_labels =
+            "\"Cut\",\"Res\",\"Atk\",\"Dcy\",\"Sus\",\"Rel\",\"Lvl\",\"Pan\"";
+
+        int w = 0;
+        #define APPEND(...) do { \
+            int _n = snprintf(buf + w, buf_len - w, __VA_ARGS__); \
+            if (_n < 0 || _n >= buf_len - w) return -1; \
+            w += _n; \
+        } while (0)
+
+        /* ---- static prefix: header + Phase A patch levels + tone_selector ---- */
+        APPEND("%s",
+            "{"
             "\"modes\":[\"patch\",\"performance\"],"
             "\"mode_param\":\"mode\","
             "\"levels\":{"
@@ -3524,61 +4034,156 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     "\"count_param\":\"preset_count\","
                     "\"name_param\":\"preset_name\","
                     "\"children\":\"patch_main\","
-                    "\"knobs\":[\"macro_cutoff\",\"macro_resonance\",\"macro_attack\",\"macro_decay\",\"macro_release\",\"macro_tvf_env_depth\",\"nvram_patchCommon_reverblevel\",\"nvram_patchCommon_choruslevel\"],"
-                    "\"knob_labels\":[\"Cut\",\"Res\",\"Atk\",\"Dcy\",\"Rel\",\"FEv\",\"Rev\",\"Cho\"],"
+                    "\"knobs\":[\"macro_cutoff\",\"macro_resonance\",\"macro_attack\",\"macro_decay\",\"macro_sustain\",\"macro_release\",\"macro_tvf_env_depth\",\"macro_lfo_depth\"],"
+                    "\"knob_labels\":[\"Cut\",\"Res\",\"Atk\",\"Dcy\",\"Sus\",\"Rel\",\"Env\",\"LFO\"],"
                     "\"params\":[]"
                 "},"
                 "\"patch_main\":{"
                     "\"label\":\"Patch\","
                     "\"children\":null,"
-                    "\"knobs\":[\"macro_cutoff\",\"macro_resonance\",\"macro_attack\",\"macro_decay\",\"macro_release\",\"macro_tvf_env_depth\",\"nvram_patchCommon_reverblevel\",\"nvram_patchCommon_choruslevel\"],"
-                    "\"knob_labels\":[\"Cut\",\"Res\",\"Atk\",\"Dcy\",\"Rel\",\"FEv\",\"Rev\",\"Cho\"],"
+                    "\"knobs\":[\"macro_cutoff\",\"macro_resonance\",\"macro_attack\",\"macro_decay\",\"macro_sustain\",\"macro_release\",\"macro_tvf_env_depth\",\"macro_lfo_depth\"],"
+                    "\"knob_labels\":[\"Cut\",\"Res\",\"Atk\",\"Dcy\",\"Sus\",\"Rel\",\"Env\",\"LFO\"],"
                     "\"params\":["
+                        "{\"key\":\"macro_cutoff\",\"label\":\"Cutoff\"},"
+                        "{\"key\":\"macro_resonance\",\"label\":\"Resonance\"},"
+                        "{\"key\":\"macro_attack\",\"label\":\"Attack\"},"
+                        "{\"key\":\"macro_decay\",\"label\":\"Decay\"},"
+                        "{\"key\":\"macro_sustain\",\"label\":\"Sustain\"},"
+                        "{\"key\":\"macro_release\",\"label\":\"Release\"},"
+                        "{\"key\":\"macro_tvf_env_depth\",\"label\":\"Filter Env\"},"
+                        "{\"key\":\"macro_lfo_depth\",\"label\":\"LFO Depth\"},"
+                        "{\"level\":\"patch_common\",\"label\":\"Common / Control\"},"
+                        "{\"level\":\"effects\",\"label\":\"Effects\"},"
                         "{\"level\":\"tone_selector\",\"label\":\"Edit Tones\"},"
-                        "{\"level\":\"patch_common\",\"label\":\"Common Settings\"},"
+                        "{\"level\":\"save_slot\",\"label\":\"Save to Slot\"},"
                         "{\"level\":\"expansions\",\"label\":\"Jump to Expansion\"}"
                     "]"
                 "},"
                 "\"patch_common\":{"
-                    "\"label\":\"Common\","
+                    "\"label\":\"Common / Control\","
                     "\"children\":null,"
-                    "\"knobs\":[\"macro_cutoff\",\"macro_resonance\",\"macro_attack\",\"macro_decay\",\"macro_release\",\"macro_tvf_env_depth\",\"nvram_patchCommon_reverblevel\",\"nvram_patchCommon_choruslevel\"],"
-                    "\"knob_labels\":[\"Cut\",\"Res\",\"Atk\",\"Dcy\",\"Rel\",\"FEv\",\"Rev\",\"Cho\"],"
+                    /* knobs must be keys present in this level's params
+                     * (renderer filters otherwise) */
+                    "\"knobs\":[\"nvram_patchCommon_patchlevel\",\"nvram_patchCommon_patchpan\",\"nvram_patchCommon_analogfeel\",\"nvram_patchCommon_bendrangeup\",\"nvram_patchCommon_bendrangedown\",\"nvram_patchCommon_portamentoswitch\",\"nvram_patchCommon_portamentotime\",\"nvram_patchCommon_keyassign\"],"
                     "\"params\":["
                         "{\"key\":\"nvram_patchCommon_patchlevel\",\"label\":\"Patch Level\"},"
                         "{\"key\":\"nvram_patchCommon_patchpan\",\"label\":\"Patch Pan\"},"
+                        "{\"key\":\"nvram_patchCommon_analogfeel\",\"label\":\"Analog Feel\"},"
+                        "{\"key\":\"octave_transpose\",\"label\":\"Octave\"},"
+                        "{\"key\":\"nvram_patchCommon_bendrangeup\",\"label\":\"Bend Up\"},"
+                        "{\"key\":\"nvram_patchCommon_bendrangedown\",\"label\":\"Bend Down\"},"
+                        "{\"key\":\"nvram_patchCommon_portamentoswitch\",\"label\":\"Portamento\"},"
+                        "{\"key\":\"nvram_patchCommon_portamentomode\",\"label\":\"Porta Mode\"},"
+                        "{\"key\":\"nvram_patchCommon_portamentotype\",\"label\":\"Porta Type\"},"
+                        "{\"key\":\"nvram_patchCommon_portamentotime\",\"label\":\"Porta Time\"},"
+                        "{\"key\":\"nvram_patchCommon_keyassign\",\"label\":\"Key Assign\"},"
+                        "{\"key\":\"nvram_patchCommon_sololegato\",\"label\":\"Solo Legato\"},"
+                        "{\"key\":\"nvram_patchCommon_velocityswitch\",\"label\":\"Velocity Sw\"}"
+                    "]"
+                "},"
+                "\"effects\":{"
+                    "\"label\":\"Effects\","
+                    "\"children\":null,"
+                    "\"knobs\":[\"nvram_patchCommon_reverbtype\",\"nvram_patchCommon_reverblevel\",\"nvram_patchCommon_reverbtime\",\"nvram_patchCommon_reverbfeedback\",\"nvram_patchCommon_chorustype\",\"nvram_patchCommon_choruslevel\",\"nvram_patchCommon_chorusdepth\",\"nvram_patchCommon_chorusrate\"],"
+                    "\"knob_labels\":[\"RvTy\",\"RvLv\",\"RvTm\",\"RvFb\",\"ChTy\",\"ChLv\",\"ChDp\",\"ChRt\"],"
+                    "\"params\":["
+                        "{\"key\":\"nvram_patchCommon_reverbtype\",\"label\":\"Reverb Type\"},"
                         "{\"key\":\"nvram_patchCommon_reverblevel\",\"label\":\"Reverb Level\"},"
                         "{\"key\":\"nvram_patchCommon_reverbtime\",\"label\":\"Reverb Time\"},"
+                        "{\"key\":\"nvram_patchCommon_reverbfeedback\",\"label\":\"Reverb Feedback\"},"
+                        "{\"key\":\"nvram_patchCommon_chorustype\",\"label\":\"Chorus Type\"},"
                         "{\"key\":\"nvram_patchCommon_choruslevel\",\"label\":\"Chorus Level\"},"
                         "{\"key\":\"nvram_patchCommon_chorusdepth\",\"label\":\"Chorus Depth\"},"
                         "{\"key\":\"nvram_patchCommon_chorusrate\",\"label\":\"Chorus Rate\"},"
-                        "{\"key\":\"nvram_patchCommon_analogfeel\",\"label\":\"Analog Feel\"},"
-                        "{\"key\":\"octave_transpose\",\"label\":\"Octave\"}"
+                        "{\"key\":\"nvram_patchCommon_chorusfeedback\",\"label\":\"Chorus Feedback\"},"
+                        "{\"key\":\"nvram_patchCommon_chorusoutput\",\"label\":\"Chorus Output\"}"
                     "]"
                 "},"
+                /* Tone selector: plain menu that navigates to one explicit
+                 * per-tone level (tone1..tone4). No child_prefix here - the
+                 * renderer does not carry that context into navigated levels. */
                 "\"tone_selector\":{"
                     "\"label\":\"Tones\","
                     "\"children\":null,"
-                    "\"child_prefix\":\"nvram_tone_\","
-                    "\"child_count\":4,"
-                    "\"child_label\":\"Tone\","
-                    "\"knobs\":[\"level\",\"pan\",\"cutofffrequency\",\"resonance\",\"lfo1pitchdepth\",\"lfo1tvfdepth\",\"tvaenvtime1\",\"tvaenvtime2\"],"
-                    "\"knob_labels\":[\"Lvl\",\"Pan\",\"Cut\",\"Res\",\"LPt\",\"LFl\",\"AT1\",\"AT2\"],"
+                    "\"knobs\":[],"
                     "\"params\":["
-                        "\"toneswitch\",\"wavegroup\",\"wavenumber\","
-                        "\"level\",\"pan\",\"levelkeyfollow\",\"panningkeyfollow\","
-                        "\"cutofffrequency\",\"resonance\",\"filtermode\",\"resonancemode\",\"cutoffkeyfollow\","
-                        "\"pitchcoarse\",\"pitchfine\",\"randompitchdepth\",\"pitchkeyfollow\","
-                        "\"lfo1form\",\"lfo1rate\",\"lfo1delay\",\"lfo1pitchdepth\",\"lfo1tvfdepth\",\"lfo1tvadepth\","
-                        "\"lfo2form\",\"lfo2rate\",\"lfo2delay\",\"lfo2pitchdepth\",\"lfo2tvfdepth\",\"lfo2tvadepth\","
-                        "\"penvdepth\",\"penvtime1\",\"penvlevel1\",\"penvtime2\",\"penvlevel2\",\"penvtime3\",\"penvlevel3\",\"penvtime4\",\"penvlevel4\","
-                        "\"tvfenvdepth\",\"tvfenvtime1\",\"tvfenvlevel1\",\"tvfenvtime2\",\"tvfenvlevel2\",\"tvfenvtime3\",\"tvfenvlevel3\",\"tvfenvtime4\",\"tvfenvlevel4\","
-                        "\"tvaenvtime1\",\"tvaenvlevel1\",\"tvaenvtime2\",\"tvaenvlevel2\",\"tvaenvtime3\",\"tvaenvlevel3\",\"tvaenvtime4\","
-                        "\"velocityrangelower\",\"velocityrangeupper\","
-                        "\"tonedelaymode\",\"tonedelaytime\","
-                        "\"fxmswitch\",\"fxmdepth\","
-                        "\"drylevel\",\"reverbsendlevel\",\"chorussendlevel\""
+                        "{\"level\":\"tone1\",\"label\":\"Tone 1\"},"
+                        "{\"level\":\"tone2\",\"label\":\"Tone 2\"},"
+                        "{\"level\":\"tone3\",\"label\":\"Tone 3\"},"
+                        "{\"level\":\"tone4\",\"label\":\"Tone 4\"},"
+                        "{\"key\":\"link_tones\",\"label\":\"Link all to 1\"}"
                     "]"
+                "},");
+
+        /* ---- per-tone levels (explicit, dx7-style) ---- */
+        for (int t = 0; t < 4; t++) {
+            /* Build the fully-qualified knob array for this tone (reused on the
+             * tone menu and every section sublevel). */
+            char knobs_json[512];
+            int kw = 0;
+            kw += snprintf(knobs_json + kw, sizeof(knobs_json) - kw, "[");
+            for (int k = 0; k < 8; k++) {
+                kw += snprintf(knobs_json + kw, sizeof(knobs_json) - kw,
+                    "%s\"nvram_tone_%d_%s\"", k ? "," : "", t, knob_suffix[k]);
+            }
+            kw += snprintf(knobs_json + kw, sizeof(knobs_json) - kw, "]");
+
+            /* tone<N> menu: nav-only (no editable params). The renderer keeps a
+             * level's FULL knob row only when the level has no editable params
+             * visible; with any editable param, knobs are filtered to keys
+             * present in params. Tone Switch lives in the Wave section. */
+            APPEND("\"tone%d\":{"
+                    "\"label\":\"Tone %d\","
+                    "\"children\":null,"
+                    "\"knobs\":%s,"
+                    "\"knob_labels\":[%s],"
+                    "\"params\":[",
+                    t + 1, t + 1, knobs_json, knob_labels);
+            for (int s = 0; s < section_count; s++) {
+                APPEND("{\"level\":\"tone%d_%s\",\"label\":\"%s\"}%s",
+                    t + 1, sections[s].id, sections[s].label,
+                    (s == section_count - 1) ? "" : ",");
+            }
+            APPEND("%s", "]},");
+
+            /* tone<N>_<section> leaf levels with fully-qualified keys.
+             * Section knobs = the section's first up-to-8 params (renderer
+             * filters knobs to keys present in this level's params). */
+            for (int s = 0; s < section_count; s++) {
+                const struct ToneSection *sec = &sections[s];
+                APPEND("\"tone%d_%s\":{"
+                        "\"label\":\"%s\","
+                        "\"children\":null,"
+                        "\"knobs\":[",
+                    t + 1, sec->id, sec->label);
+                int nk = sec->param_count < 8 ? sec->param_count : 8;
+                for (int k = 0; k < nk; k++) {
+                    APPEND("%s\"nvram_tone_%d_%s\"", k ? "," : "", t,
+                        sec->params[k].suffix);
+                }
+                APPEND("%s", "],\"params\":[");
+                for (int p = 0; p < sec->param_count; p++) {
+                    APPEND("{\"key\":\"nvram_tone_%d_%s\",\"label\":\"%s\"}%s",
+                        t, sec->params[p].suffix, sec->params[p].label,
+                        (p == sec->param_count - 1) ? "" : ",");
+                }
+                APPEND("%s", "]},");
+            }
+        }
+
+        /* ---- static suffix: save_slot + performance tree ---- */
+        APPEND("%s",
+                /* Save to user slot: items_param lists all 64 slots with their
+                 * stored names; selecting one fires do_save_to_slot then returns
+                 * to the patch edit menu via navigate_to. */
+                "\"save_slot\":{"
+                    "\"label\":\"Save to Slot\","
+                    "\"items_param\":\"save_patch_slot_list\","
+                    "\"select_param\":\"do_save_to_slot\","
+                    "\"navigate_to\":\"patch\","
+                    "\"children\":null,"
+                    "\"knobs\":[],"
+                    "\"params\":[]"
                 "},"
                 "\"performance\":{"
                     "\"list_param\":\"performance\","
@@ -3626,113 +4231,191 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     "\"params\":[]"
                 "}"
             "}"
-        "}";
-        int len = strlen(hierarchy);
-        if (len < buf_len) {
-            strcpy(buf, hierarchy);
-            return len;
-        }
-        return -1;
+        "}");
+
+        #undef APPEND
+        return w;
     }
 
-    /* Chain params metadata for shadow parameter editor */
+    /* Chain params metadata for shadow parameter editor.
+     *
+     * The platform renderer (shadow_ui.js getParamMetadata) matches a param
+     * entry's key EXACTLY against a chain_params key. Per-tone hierarchy entries
+     * use fully-qualified keys (nvram_tone_<n>_<suffix>), so chain_params must
+     * carry one metadata entry per (tone, suffix). We emit the static head/tail
+     * verbatim and generate the tone block with a snprintf loop over 4 tones.
+     * Part params stay bare-keyed: part_selector is a child_prefix level whose
+     * inline params resolve the sram_part_<n>_ prefix at set/get time, while
+     * metadata lookup uses the bare suffix. */
     if (strcmp(key, "chain_params") == 0) {
-        const char *params_json = "["
+        /* Per-tone metadata table: {suffix, tail} where tail is the JSON object
+         * body after the "key" field. Keys are emitted fully qualified below. */
+        struct ToneMeta { const char *suffix; const char *tail; };
+        static const struct ToneMeta tone_meta[] = {
+            /* Wave */
+            {"toneswitch",                 "\"name\":\"Tone Switch\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]"},
+            {"wavegroup",                  "\"name\":\"Wave Group\",\"type\":\"enum\",\"min\":0,\"max\":3,\"options\":[\"INT-A\",\"INT-B\",\"EXP-A\",\"EXP-B\"]"},
+            {"wavenumber",                 "\"name\":\"Wave Number\",\"type\":\"int\",\"min\":0,\"max\":255"},
+            {"fxmswitch",                  "\"name\":\"FXM\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]"},
+            {"fxmdepth",                   "\"name\":\"FXM Depth\",\"type\":\"int\",\"min\":0,\"max\":15"},
+            /* Level/Pan */
+            {"level",                      "\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"pan",                        "\"name\":\"Pan\",\"type\":\"int\",\"min\":-64,\"max\":63,\"display\":\"pan\""},
+            {"levelkeyfollow",             "\"name\":\"Level KF\",\"type\":\"int\",\"min\":0,\"max\":15"},
+            {"panningkeyfollow",           "\"name\":\"Pan KF\",\"type\":\"int\",\"min\":0,\"max\":15"},
+            /* Filter */
+            {"cutofffrequency",            "\"name\":\"Cutoff\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"resonance",                  "\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"filtermode",                 "\"name\":\"Filter Mode\",\"type\":\"enum\",\"options\":[\"Off\",\"LPF\",\"HPF\"]"},
+            {"resonancemode",              "\"name\":\"Reso Mode\",\"type\":\"enum\",\"options\":[\"Soft\",\"Hard\"]"},
+            {"cutoffkeyfollow",            "\"name\":\"Cutoff KF\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            /* Pitch */
+            {"pitchcoarse",                "\"name\":\"Pitch Coarse\",\"type\":\"int\",\"min\":-48,\"max\":48,\"display\":\"signed\""},
+            {"pitchfine",                  "\"name\":\"Pitch Fine\",\"type\":\"int\",\"min\":-50,\"max\":50,\"display\":\"signed\""},
+            {"randompitchdepth",           "\"name\":\"Random Pitch\",\"type\":\"int\",\"min\":0,\"max\":7"},
+            {"pitchkeyfollow",             "\"name\":\"Pitch KF\",\"type\":\"int\",\"min\":0,\"max\":15"},
+            /* LFO1 */
+            {"lfo1form",                   "\"name\":\"LFO1 Wave\",\"type\":\"enum\",\"min\":0,\"max\":5,\"options\":[\"TRI\",\"SIN\",\"SAW\",\"SQU\",\"RND1\",\"RND2\"]"},
+            {"lfo1rate",                   "\"name\":\"LFO1 Rate\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"lfo1delay",                  "\"name\":\"LFO1 Delay\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"lfo1fadetime",               "\"name\":\"LFO1 Fade\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"lfo1offset",                 "\"name\":\"LFO1 Offset\",\"type\":\"enum\",\"min\":0,\"max\":4,\"options\":[\"-100\",\"-50\",\"0\",\"+50\",\"+100\"]"},
+            {"lfo1synchro",                "\"name\":\"LFO1 Sync\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]"},
+            {"lfo1pitchdepth",             "\"name\":\"LFO1 Pitch\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"lfo1tvfdepth",               "\"name\":\"LFO1 Filter\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"lfo1tvadepth",               "\"name\":\"LFO1 Amp\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            /* LFO2 */
+            {"lfo2form",                   "\"name\":\"LFO2 Wave\",\"type\":\"enum\",\"min\":0,\"max\":5,\"options\":[\"TRI\",\"SIN\",\"SAW\",\"SQU\",\"RND1\",\"RND2\"]"},
+            {"lfo2rate",                   "\"name\":\"LFO2 Rate\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"lfo2delay",                  "\"name\":\"LFO2 Delay\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"lfo2fadetime",               "\"name\":\"LFO2 Fade\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"lfo2pitchdepth",             "\"name\":\"LFO2 Pitch\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"lfo2tvfdepth",               "\"name\":\"LFO2 Filter\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"lfo2tvadepth",               "\"name\":\"LFO2 Amp\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            /* Pitch Envelope */
+            {"penvdepth",                  "\"name\":\"P.Env Depth\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"penvtime1",                  "\"name\":\"P.Env T1\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"penvlevel1",                 "\"name\":\"P.Env L1\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"penvtime2",                  "\"name\":\"P.Env T2\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"penvlevel2",                 "\"name\":\"P.Env L2\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"penvtime3",                  "\"name\":\"P.Env T3\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"penvlevel3",                 "\"name\":\"P.Env L3\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"penvtime4",                  "\"name\":\"P.Env T4\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"penvlevel4",                 "\"name\":\"P.Env L4\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            /* Filter Envelope */
+            {"tvfenvdepth",                "\"name\":\"F.Env Depth\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"tvfenvvelocitylevelsense",   "\"name\":\"F.Env Velo\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"tvfenvtime1",                "\"name\":\"F.Env T1\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvfenvlevel1",               "\"name\":\"F.Env L1\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvfenvtime2",                "\"name\":\"F.Env T2\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvfenvlevel2",               "\"name\":\"F.Env L2\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvfenvtime3",                "\"name\":\"F.Env T3\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvfenvlevel3",               "\"name\":\"F.Env L3\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvfenvtime4",                "\"name\":\"F.Env T4\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvfenvlevel4",               "\"name\":\"F.Env L4\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            /* Amp Envelope */
+            {"tvaenvtime1",                "\"name\":\"A.Env T1\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvaenvlevel1",               "\"name\":\"A.Env L1\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvaenvtime2",                "\"name\":\"A.Env T2\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvaenvlevel2",               "\"name\":\"A.Env L2\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvaenvtime3",                "\"name\":\"A.Env T3\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvaenvlevel3",               "\"name\":\"A.Env L3\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvaenvtime4",                "\"name\":\"A.Env T4\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"tvaenvvelocitylevelsense",   "\"name\":\"A.Env Velo\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""},
+            {"tvaenvvelocitycurve",        "\"name\":\"A.Env Curve\",\"type\":\"int\",\"min\":0,\"max\":6"},
+            /* Velocity/Delay */
+            {"velocityrangelower",         "\"name\":\"Vel Lo\",\"type\":\"int\",\"min\":1,\"max\":127"},
+            {"velocityrangeupper",         "\"name\":\"Vel Hi\",\"type\":\"int\",\"min\":1,\"max\":127"},
+            {"tonedelaymode",              "\"name\":\"Delay Mode\",\"type\":\"enum\",\"min\":0,\"max\":3,\"options\":[\"Normal\",\"Hold\",\"Play-Mate\",\"Clock\"]"},
+            {"tonedelaytime",              "\"name\":\"Delay Time\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            /* Output */
+            {"drylevel",                   "\"name\":\"Dry Level\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"reverbsendlevel",            "\"name\":\"Reverb Send\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            {"chorussendlevel",            "\"name\":\"Chorus Send\",\"type\":\"int\",\"min\":0,\"max\":127"},
+            /* Control matrix: 3 sources x (4 dest enums + 4 signed sens). Dest
+             * enum order matches the firmware's destination indices 0..12. */
+            #define MXDEST(nm) "\"name\":\"" nm "\",\"type\":\"enum\",\"options\":[\"Off\",\"Pitch\",\"Cutoff\",\"Reso\",\"Level\",\"L1>Pit\",\"L2>Pit\",\"L1>TVF\",\"L2>TVF\",\"L1>TVA\",\"L2>TVA\",\"L1 Rate\",\"L2 Rate\"]"
+            #define MXSENS(nm) "\"name\":\"" nm "\",\"type\":\"int\",\"min\":-63,\"max\":63,\"display\":\"signed\""
+            {"moddesta", MXDEST("Mod Dest A")}, {"modsensa", MXSENS("Mod Sens A")},
+            {"moddestb", MXDEST("Mod Dest B")}, {"modsensb", MXSENS("Mod Sens B")},
+            {"moddestc", MXDEST("Mod Dest C")}, {"modsensc", MXSENS("Mod Sens C")},
+            {"moddestd", MXDEST("Mod Dest D")}, {"modsensd", MXSENS("Mod Sens D")},
+            {"aftdesta", MXDEST("Aft Dest A")}, {"aftsensa", MXSENS("Aft Sens A")},
+            {"aftdestb", MXDEST("Aft Dest B")}, {"aftsensb", MXSENS("Aft Sens B")},
+            {"aftdestc", MXDEST("Aft Dest C")}, {"aftsensc", MXSENS("Aft Sens C")},
+            {"aftdestd", MXDEST("Aft Dest D")}, {"aftsensd", MXSENS("Aft Sens D")},
+            {"expdesta", MXDEST("Exp Dest A")}, {"expsensa", MXSENS("Exp Sens A")},
+            {"expdestb", MXDEST("Exp Dest B")}, {"expsensb", MXSENS("Exp Sens B")},
+            {"expdestc", MXDEST("Exp Dest C")}, {"expsensc", MXSENS("Exp Sens C")},
+            {"expdestd", MXDEST("Exp Dest D")}, {"expsensd", MXSENS("Exp Sens D")},
+            #undef MXDEST
+            #undef MXSENS
+        };
+        const int tone_meta_count = (int)(sizeof(tone_meta)/sizeof(tone_meta[0]));
+
+        int w = 0;
+        #define APPEND(...) do { \
+            int _n = snprintf(buf + w, buf_len - w, __VA_ARGS__); \
+            if (_n < 0 || _n >= buf_len - w) return -1; \
+            w += _n; \
+        } while (0)
+
+        /* ---- static head: navigation + macros + patch common ---- */
+        APPEND("%s",
+            "["
             /* Basic navigation */
             "{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":9999},"
             "{\"key\":\"performance\",\"name\":\"Performance\",\"type\":\"int\",\"min\":0,\"max\":47},"
             "{\"key\":\"part\",\"name\":\"Part\",\"type\":\"int\",\"min\":0,\"max\":7},"
             "{\"key\":\"octave_transpose\",\"name\":\"Octave\",\"type\":\"int\",\"min\":-3,\"max\":3},"
-            /* Macro controls (offset all 4 tones simultaneously) */
-            "{\"key\":\"macro_cutoff\",\"name\":\"Cut\",\"type\":\"int\",\"min\":-64,\"max\":63},"
-            "{\"key\":\"macro_resonance\",\"name\":\"Res\",\"type\":\"int\",\"min\":-64,\"max\":63},"
-            "{\"key\":\"macro_attack\",\"name\":\"Atk\",\"type\":\"int\",\"min\":-64,\"max\":63},"
-            "{\"key\":\"macro_decay\",\"name\":\"Dcy\",\"type\":\"int\",\"min\":-64,\"max\":63},"
-            "{\"key\":\"macro_release\",\"name\":\"Rel\",\"type\":\"int\",\"min\":-64,\"max\":63},"
-            "{\"key\":\"macro_tvf_env_depth\",\"name\":\"FEv\",\"type\":\"int\",\"min\":-64,\"max\":63},"
+            "{\"key\":\"link_tones\",\"name\":\"Link all to 1\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
+            /* Macro controls (absolute-anchored: display = anchor tone value,
+             * ranges match backing tone params; tvf_env_depth is signed). */
+            "{\"key\":\"macro_cutoff\",\"name\":\"Cutoff\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
+            "{\"key\":\"macro_resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
+            "{\"key\":\"macro_attack\",\"name\":\"Attack\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
+            "{\"key\":\"macro_decay\",\"name\":\"Decay\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
+            "{\"key\":\"macro_release\",\"name\":\"Release\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
+            "{\"key\":\"macro_sustain\",\"name\":\"Sustain\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
+            "{\"key\":\"macro_tvf_env_depth\",\"name\":\"Filter Env\",\"type\":\"int\",\"min\":-63,\"max\":63,\"step\":1},"
+            "{\"key\":\"macro_lfo_depth\",\"name\":\"LFO Depth\",\"type\":\"int\",\"min\":-63,\"max\":63,\"step\":1},"
             /* Patch common params */
             "{\"key\":\"nvram_patchCommon_patchlevel\",\"name\":\"Patch Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"nvram_patchCommon_patchpan\",\"name\":\"Patch Pan\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"nvram_patchCommon_reverblevel\",\"name\":\"Rev\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"nvram_patchCommon_reverblevel\",\"name\":\"Reverb\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
             "{\"key\":\"nvram_patchCommon_reverbtime\",\"name\":\"Reverb Time\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"nvram_patchCommon_choruslevel\",\"name\":\"Cho\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"nvram_patchCommon_choruslevel\",\"name\":\"Chorus\",\"type\":\"int\",\"min\":0,\"max\":127,\"step\":1},"
             "{\"key\":\"nvram_patchCommon_chorusdepth\",\"name\":\"Chorus Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"nvram_patchCommon_chorusrate\",\"name\":\"Chorus Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"nvram_patchCommon_analogfeel\",\"name\":\"Analog Feel\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - Wave */
-            "{\"key\":\"toneswitch\",\"name\":\"Tone Switch\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
-            "{\"key\":\"wavegroup\",\"name\":\"Wave Group\",\"type\":\"int\",\"min\":0,\"max\":3},"
-            "{\"key\":\"wavenumber\",\"name\":\"Wave Number\",\"type\":\"int\",\"min\":0,\"max\":255},"
-            /* Tone params - Level/Pan */
-            "{\"key\":\"level\",\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"pan\",\"name\":\"Pan\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"levelkeyfollow\",\"name\":\"Level KF\",\"type\":\"int\",\"min\":0,\"max\":15},"
-            "{\"key\":\"panningkeyfollow\",\"name\":\"Pan KF\",\"type\":\"int\",\"min\":0,\"max\":15},"
-            /* Tone params - Filter */
-            "{\"key\":\"cutofffrequency\",\"name\":\"Cutoff\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"resonance\",\"name\":\"Resonance\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"filtermode\",\"name\":\"Filter Mode\",\"type\":\"enum\",\"options\":[\"Off\",\"LPF\",\"HPF\"]},"
-            "{\"key\":\"resonancemode\",\"name\":\"Reso Mode\",\"type\":\"enum\",\"options\":[\"Soft\",\"Hard\"]},"
-            "{\"key\":\"cutoffkeyfollow\",\"name\":\"Cutoff KF\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - Pitch */
-            "{\"key\":\"pitchcoarse\",\"name\":\"Pitch Coarse\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"pitchfine\",\"name\":\"Pitch Fine\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"randompitchdepth\",\"name\":\"Random Pitch\",\"type\":\"int\",\"min\":0,\"max\":7},"
-            "{\"key\":\"pitchkeyfollow\",\"name\":\"Pitch KF\",\"type\":\"int\",\"min\":0,\"max\":15},"
-            /* Tone params - LFO1 */
-            "{\"key\":\"lfo1form\",\"name\":\"LFO1 Wave\",\"type\":\"int\",\"min\":0,\"max\":5},"
-            "{\"key\":\"lfo1rate\",\"name\":\"LFO1 Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo1delay\",\"name\":\"LFO1 Delay\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo1pitchdepth\",\"name\":\"LFO1 Pitch\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo1tvfdepth\",\"name\":\"LFO1 Filter\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo1tvadepth\",\"name\":\"LFO1 Amp\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - LFO2 */
-            "{\"key\":\"lfo2form\",\"name\":\"LFO2 Wave\",\"type\":\"int\",\"min\":0,\"max\":5},"
-            "{\"key\":\"lfo2rate\",\"name\":\"LFO2 Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo2delay\",\"name\":\"LFO2 Delay\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo2pitchdepth\",\"name\":\"LFO2 Pitch\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo2tvfdepth\",\"name\":\"LFO2 Filter\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"lfo2tvadepth\",\"name\":\"LFO2 Amp\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - Pitch Envelope */
-            "{\"key\":\"penvdepth\",\"name\":\"P.Env Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvtime1\",\"name\":\"P.Env T1\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvlevel1\",\"name\":\"P.Env L1\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvtime2\",\"name\":\"P.Env T2\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvlevel2\",\"name\":\"P.Env L2\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvtime3\",\"name\":\"P.Env T3\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvlevel3\",\"name\":\"P.Env L3\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvtime4\",\"name\":\"P.Env T4\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"penvlevel4\",\"name\":\"P.Env L4\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - Filter Envelope */
-            "{\"key\":\"tvfenvdepth\",\"name\":\"F.Env Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvtime1\",\"name\":\"F.Env T1\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvlevel1\",\"name\":\"F.Env L1\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvtime2\",\"name\":\"F.Env T2\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvlevel2\",\"name\":\"F.Env L2\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvtime3\",\"name\":\"F.Env T3\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvlevel3\",\"name\":\"F.Env L3\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvtime4\",\"name\":\"F.Env T4\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvfenvlevel4\",\"name\":\"F.Env L4\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - Amp Envelope */
-            "{\"key\":\"tvaenvtime1\",\"name\":\"A.Env T1\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvaenvlevel1\",\"name\":\"A.Env L1\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvaenvtime2\",\"name\":\"A.Env T2\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvaenvlevel2\",\"name\":\"A.Env L2\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvaenvtime3\",\"name\":\"A.Env T3\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvaenvlevel3\",\"name\":\"A.Env L3\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"tvaenvtime4\",\"name\":\"A.Env T4\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - Velocity/Delay */
-            "{\"key\":\"velocityrangelower\",\"name\":\"Vel Lo\",\"type\":\"int\",\"min\":1,\"max\":127},"
-            "{\"key\":\"velocityrangeupper\",\"name\":\"Vel Hi\",\"type\":\"int\",\"min\":1,\"max\":127},"
-            "{\"key\":\"tonedelaymode\",\"name\":\"Delay Mode\",\"type\":\"int\",\"min\":0,\"max\":3},"
-            "{\"key\":\"tonedelaytime\",\"name\":\"Delay Time\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            /* Tone params - FXM */
-            "{\"key\":\"fxmswitch\",\"name\":\"FXM\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
-            "{\"key\":\"fxmdepth\",\"name\":\"FXM Depth\",\"type\":\"int\",\"min\":0,\"max\":15},"
-            /* Tone params - Output */
-            "{\"key\":\"drylevel\",\"name\":\"Dry Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"reverbsendlevel\",\"name\":\"Reverb Send\",\"type\":\"int\",\"min\":0,\"max\":127},"
-            "{\"key\":\"chorussendlevel\",\"name\":\"Chorus Send\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            /* Effects: reverb/chorus type + feedback + output */
+            "{\"key\":\"nvram_patchCommon_reverbtype\",\"name\":\"Reverb Type\",\"type\":\"enum\",\"options\":[\"Room1\",\"Room2\",\"Stage1\",\"Stage2\",\"Hall1\",\"Hall2\",\"Delay\",\"Pan-Dly\"]},"
+            "{\"key\":\"nvram_patchCommon_reverbfeedback\",\"name\":\"Reverb Feedback\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"nvram_patchCommon_chorustype\",\"name\":\"Chorus Type\",\"type\":\"enum\",\"options\":[\"Chorus1\",\"Chorus2\",\"Chorus3\"]},"
+            "{\"key\":\"nvram_patchCommon_chorusfeedback\",\"name\":\"Chorus Feedback\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"nvram_patchCommon_chorusoutput\",\"name\":\"Chorus Output\",\"type\":\"enum\",\"options\":[\"Mix\",\"Reverb\"]},"
+            /* Control / play */
+            "{\"key\":\"nvram_patchCommon_bendrangeup\",\"name\":\"Bend Up\",\"type\":\"int\",\"min\":0,\"max\":12},"
+            "{\"key\":\"nvram_patchCommon_bendrangedown\",\"name\":\"Bend Down\",\"type\":\"int\",\"min\":0,\"max\":48},"
+            "{\"key\":\"nvram_patchCommon_portamentoswitch\",\"name\":\"Portamento\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
+            "{\"key\":\"nvram_patchCommon_portamentomode\",\"name\":\"Porta Mode\",\"type\":\"enum\",\"options\":[\"Legato\",\"Normal\"]},"
+            "{\"key\":\"nvram_patchCommon_portamentotype\",\"name\":\"Porta Type\",\"type\":\"enum\",\"options\":[\"Time\",\"Rate\"]},"
+            "{\"key\":\"nvram_patchCommon_portamentotime\",\"name\":\"Porta Time\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"nvram_patchCommon_keyassign\",\"name\":\"Key Assign\",\"type\":\"enum\",\"options\":[\"Poly\",\"Solo\"]},"
+            "{\"key\":\"nvram_patchCommon_sololegato\",\"name\":\"Solo Legato\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
+            "{\"key\":\"nvram_patchCommon_velocityswitch\",\"name\":\"Velocity Sw\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},");
+
+        /* ---- per-tone metadata (fully-qualified keys, 4 tones) ---- */
+        for (int t = 0; t < 4; t++) {
+            for (int m = 0; m < tone_meta_count; m++) {
+                APPEND("{\"key\":\"nvram_tone_%d_%s\",%s},",
+                    t, tone_meta[m].suffix, tone_meta[m].tail);
+            }
+        }
+
+        /* ---- static tail: part params (bare keys; sram_part_<n>_ added by the
+         * part_selector child_prefix at set/get time) ---- */
+        APPEND("%s",
             /* Part params (suffix only - child_prefix adds sram_part_N_) */
             "{\"key\":\"patchbank\",\"name\":\"Bank\",\"type\":\"enum\",\"options\":[\"Internal\",\"Preset A\",\"Preset B\"]},"
             "{\"key\":\"partlevel\",\"name\":\"Part Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
@@ -3745,13 +4428,10 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             "{\"key\":\"internalkeyrangelower\",\"name\":\"Key Lo\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"internalkeyrangeupper\",\"name\":\"Key Hi\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"internalkeytranspose\",\"name\":\"Transpose\",\"type\":\"int\",\"min\":16,\"max\":112}"
-        "]";
-        int len = strlen(params_json);
-        if (len < buf_len) {
-            strcpy(buf, params_json);
-            return len;
-        }
-        return -1;
+        "]");
+
+        #undef APPEND
+        return w;
     }
 
 #if JV880_PERF_STATS
