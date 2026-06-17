@@ -84,6 +84,7 @@ echo "Packaging..."
 cat src/module.json > dist/minijv/module.json
 [ -f src/help.json ] && cat src/help.json > dist/minijv/help.json
 cat src/ui.js > dist/minijv/ui.js
+[ -f src/web_ui.html ] && cat src/web_ui.html > dist/minijv/web_ui.html
 cat src/ui_menu.mjs > dist/minijv/ui_menu.mjs
 cat src/ui_browser.mjs > dist/minijv/ui_browser.mjs
 cat src/jv880_sysex.mjs > dist/minijv/jv880_sysex.mjs
