@@ -58,6 +58,12 @@ let itemsList = [];
 let editingParam = null;    // Currently editing parameter key
 let editingValue = 0;       // Current value being edited
 
+// Knob overlay state
+let knobOverlayParam = null;   // Param key being shown in overlay
+let knobOverlayValue = 0;      // Value at time of last knob turn
+let knobOverlayTick = 0;       // Tick when overlay was last updated
+const KNOB_OVERLAY_TICKS = 60; // ~2 seconds at 30fps
+
 let shiftHeld = false;
 let needsRedraw = true;
 let loadingComplete = false;
@@ -140,6 +146,7 @@ function navigateToLevel(levelName) {
     }
 
     needsRedraw = true;
+    announceView(currentLevel.label || levelName);
     console.log("Navigated to level: " + levelName);
 }
 
@@ -168,13 +175,29 @@ function switchMode(newMode) {
     }
 }
 
+/* === Screen-reader announcements ===
+ * The host has no dedicated TTS channel today, so these route through the same
+ * console.log the rest of the UI uses. They give a single, named hook point
+ * (matching the platform convention) that a screen-reader layer can later
+ * intercept without touching call sites — no new subsystem is introduced. */
+function announceView(label) {
+    console.log("[view] " + label);
+}
+function announceMenuItem(label, value) {
+    console.log("[item] " + label + (value !== undefined && value !== '' ? ": " + value : ""));
+}
+
 /* === Parameter Handling === */
 function getParamMeta(key) {
     return chainParamsMap[key] || { name: key, type: 'int', min: 0, max: 127 };
 }
 
 function getFullParamKey(key) {
-    // Handle child prefix (e.g., nvram_tone_0_cutofffrequency)
+    // Handle child prefix (e.g., part_selector -> sram_part_0_partlevel).
+    // NOTE: per-tone editing now uses EXPLICIT per-tone levels whose param keys
+    // are already fully qualified (nvram_tone_<n>_<param>), matching what the
+    // platform's shadow_ui.js renderer requires in a chain slot. No tone_section
+    // key rewriting is done here.
     if (currentLevel.child_prefix) {
         return currentLevel.child_prefix + selectedChildIndex + '_' + key;
     }
@@ -327,11 +350,22 @@ function handleChildSelectorInput(cc, value) {
         menuIndex = Math.min(params.length - 1, menuIndex + 1);
         needsRedraw = true;
     } else if (cc === CC_JOG_CLICK) {
-        // Start editing selected param
-        const paramKey = typeof params[menuIndex] === 'string' ? params[menuIndex] : params[menuIndex].key;
+        const item = params[menuIndex];
+        // Navigation item (e.g. a tone or section page): descend into it. Target
+        // levels are explicit and carry fully-qualified keys, so no per-level
+        // tone state needs to be persisted.
+        if (item && typeof item === 'object' && item.level) {
+            announceView(item.label || item.level);
+            navigateToLevel(item.level);
+            return;
+        }
+        // Otherwise start editing the selected param for the current tone.
+        const paramKey = typeof item === 'string' ? item : (item && item.key);
         if (paramKey) {
             editingParam = paramKey;
             editingValue = getParamValue(paramKey);
+            announceMenuItem(getParamMeta(paramKey).name || paramKey,
+                             formatValue(editingValue, getParamMeta(paramKey)));
             needsRedraw = true;
         }
     }
@@ -354,6 +388,8 @@ function handleMenuInput(cc, value) {
                 // Simple param key - start editing
                 editingParam = item;
                 editingValue = getParamValue(item);
+                announceMenuItem(getParamMeta(item).name || item,
+                                 formatValue(editingValue, getParamMeta(item)));
             } else if (item.level) {
                 // Navigation to sublevel
                 navigateToLevel(item.level);
@@ -361,6 +397,8 @@ function handleMenuInput(cc, value) {
                 // Param with label - start editing
                 editingParam = item.key;
                 editingValue = getParamValue(item.key);
+                announceMenuItem(item.label || getParamMeta(item.key).name || item.key,
+                                 formatValue(editingValue, getParamMeta(item.key)));
             }
             needsRedraw = true;
         }
@@ -405,6 +443,12 @@ function handleKnob(knobIndex, delta) {
     value += delta * step;
 
     setParamValue(paramKey, value);
+
+    // Update knob overlay state
+    knobOverlayParam = paramKey;
+    knobOverlayValue = getParamValue(paramKey); // read back clamped value
+    knobOverlayTick = tickCount;
+    needsRedraw = true;
 }
 
 /* === Drawing === */
@@ -413,6 +457,7 @@ function draw() {
 
     if (!loadingComplete || !hierarchy) {
         drawLoading();
+        display.flush();
         return;
     }
 
@@ -424,6 +469,15 @@ function draw() {
         drawChildSelector();
     } else {
         drawMenu();
+    }
+
+    // Draw knob overlay on top if active
+    if (knobOverlayParam && (tickCount - knobOverlayTick) < KNOB_OVERLAY_TICKS) {
+        drawKnobOverlay();
+    } else if (knobOverlayParam) {
+        // Overlay expired — clear state and force a clean redraw next tick
+        knobOverlayParam = null;
+        needsRedraw = true;
     }
 
     display.flush();
@@ -526,14 +580,27 @@ function drawChildSelector() {
     for (let i = 0; i < visibleItems && startIdx + i < params.length; i++) {
         const idx = startIdx + i;
         const param = params[idx];
+
+        const y = 14 + i * 10;
+
+        // Section navigation item (e.g. Wave/Pitch/...): show "Label >", no value.
+        if (param && typeof param === 'object' && param.level) {
+            const navLabel = (param.label || param.level) + ' >';
+            if (idx === menuIndex) {
+                display.fillRect(0, y - 1, SCREEN_WIDTH, 10, 1);
+                display.drawText(4, y, navLabel, 0);
+            } else {
+                display.drawText(4, y, navLabel, 1);
+            }
+            continue;
+        }
+
         const paramKey = typeof param === 'string' ? param : param.key;
         const meta = getParamMeta(paramKey);
 
         const t1 = Date.now();
         const value = getParamValue(paramKey);
         getParamTime += Date.now() - t1;
-
-        const y = 14 + i * 10;
 
         const label = meta.name || paramKey;
         const valueStr = formatValue(value, meta);
@@ -619,7 +686,54 @@ function formatValue(value, meta) {
     if (meta.options) {
         return meta.options[value] || String(value);
     }
+    // Pan-style display: 0 is center, negatives L, positives R (e.g. L23 / C / R12).
+    if (meta.display === 'pan') {
+        if (value === 0) return 'C';
+        return value < 0 ? 'L' + (-value) : 'R' + value;
+    }
+    // Signed/centered params: show an explicit + on positives so polarity reads
+    // clearly (e.g. pitch +3, env depth -12). The C plugin already returns the
+    // value pre-centered, so no offset math is needed here.
+    if (meta.display === 'signed' && value > 0) {
+        return '+' + value;
+    }
     return String(value);
+}
+
+/* === Knob Overlay === */
+// Drawn on top of any screen when a knob was recently turned.
+// Shows: param name (line 1) and value with range context (line 2).
+// Disappears after KNOB_OVERLAY_TICKS ticks of no knob activity.
+function drawKnobOverlay() {
+    if (!knobOverlayParam) return;
+
+    const meta = getParamMeta(knobOverlayParam);
+    const name = meta.name || knobOverlayParam;
+    const valueStr = formatValue(knobOverlayValue, meta);
+
+    // Build range hint, e.g. "92 [0..127]" — keep total <=21 chars
+    const rangeHint = (meta.min !== undefined && meta.max !== undefined)
+        ? valueStr + ' [' + meta.min + '..' + meta.max + ']'
+        : valueStr;
+
+    // Overlay box: 4px padding, centered vertically around y=24
+    const boxW = SCREEN_WIDTH - 8;      // 120px wide
+    const boxX = 4;
+    const boxY = 18;
+    const boxH = 26;
+
+    // White fill + black border
+    display.fillRect(boxX, boxY, boxW, boxH, 1);
+    display.drawRect(boxX, boxY, boxW, boxH, 0);
+
+    // Line 1: param name (truncate to 19 chars to stay inside box)
+    const displayName = name.length > 19 ? name.substring(0, 19) : name;
+    const nameX = boxX + 4;
+    display.drawText(nameX, boxY + 3, displayName, 0);
+
+    // Line 2: value + range (truncate to 19 chars)
+    const displayRange = rangeHint.length > 19 ? rangeHint.substring(0, 19) : rangeHint;
+    display.drawText(nameX, boxY + 14, displayRange, 0);
 }
 
 /* === Tick === */

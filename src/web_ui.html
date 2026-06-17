@@ -1,0 +1,861 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mini-JV Editor</title>
+<style>
+  /* ---- Theme ---------------------------------------------------------- */
+  :root{
+    --bg:#15171c; --panel:#1d2026; --panel2:#23272f; --edge:#2e333d;
+    --ink:#e8eaed; --dim:#9aa3af; --accent:#ff8a3d; --accent2:#4db1ff;
+    --on:#4ade80; --off:#4b5563; --grid:#2a2f38;
+    --r:8px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{
+    background:var(--bg); color:var(--ink);
+    font:13px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  #app{display:flex;flex-direction:column;min-height:100%}
+  .muted{color:var(--dim)}
+  .hidden{display:none!important}
+
+  /* ---- Header bar ----------------------------------------------------- */
+  header{
+    position:sticky;top:0;z-index:10;background:linear-gradient(#1b1e24,#16181d);
+    border-bottom:1px solid var(--edge);padding:8px 12px;display:flex;
+    flex-wrap:wrap;gap:14px;align-items:center;
+  }
+  .brand{font-weight:700;letter-spacing:.5px;color:var(--accent);font-size:15px}
+  .brand small{color:var(--dim);font-weight:500;letter-spacing:0}
+  .preset{display:flex;align-items:center;gap:6px}
+  .preset .name{min-width:150px;text-align:center;background:var(--panel2);
+    border:1px solid var(--edge);border-radius:var(--r);padding:5px 10px;font-weight:600}
+  .preset .idx{font-variant-numeric:tabular-nums;color:var(--dim);min-width:62px;text-align:center}
+  button.nav{background:var(--panel2);border:1px solid var(--edge);color:var(--ink);
+    border-radius:6px;padding:5px 10px;cursor:pointer;font-size:14px}
+  button.nav:hover{border-color:var(--accent)}
+  .sep{width:1px;align-self:stretch;background:var(--edge)}
+  #status{margin-left:auto;font-size:11px;color:var(--dim);display:flex;align-items:center;gap:6px}
+  #dot{width:8px;height:8px;border-radius:50%;background:var(--off)}
+  #dot.ok{background:var(--on)} #dot.err{background:#ef4444}
+
+  /* ---- Generic layout ------------------------------------------------- */
+  main{padding:12px;display:flex;flex-direction:column;gap:12px;max-width:920px;width:100%;margin:0 auto}
+  .panel{background:var(--panel);border:1px solid var(--edge);border-radius:var(--r);padding:10px 12px}
+  .panel > h2{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim);font-weight:700}
+  .row{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:flex-start}
+  /* evenly distribute controls across the full block width */
+  .fillrow{display:grid;grid-auto-flow:column;grid-auto-columns:1fr;gap:16px;align-items:start}
+  .fillrow > *{min-width:0}
+  .grid{display:grid;gap:10px 14px}
+  /* labeled sub-group inside a panel (e.g. Reverb / Chorus, Voice / Portamento) */
+  .grouplabel{font-size:10px;text-transform:uppercase;letter-spacing:.6px;color:var(--accent2);
+    font-weight:700;margin:10px 0 4px}
+  .grouplabel:first-child{margin-top:0}
+
+  /* ---- Control widget ------------------------------------------------- */
+  .ctl{display:flex;flex-direction:column;gap:3px;min-width:96px}
+  .ctl > label{font-size:10.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ctl .val{font-variant-numeric:tabular-nums;color:var(--ink);font-weight:600;font-size:12px}
+  .ctl .line{display:flex;align-items:center;gap:6px}
+  input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:3px;
+    background:var(--grid);outline:none;flex:1;min-width:70px}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;
+    background:var(--accent);cursor:pointer;border:2px solid #1b1e24}
+  input[type=range].signed::-webkit-slider-thumb{background:var(--accent2)}
+  select,input[type=number]{background:var(--panel2);color:var(--ink);border:1px solid var(--edge);
+    border-radius:6px;padding:4px 6px;font:inherit}
+  input[type=number]{width:58px;font-variant-numeric:tabular-nums}
+  .sw{display:inline-flex;align-items:center;gap:6px;cursor:pointer;user-select:none}
+  .sw .led{width:14px;height:14px;border-radius:50%;background:var(--off);border:1px solid #000;transition:background .1s}
+  .sw.on .led{background:var(--on);box-shadow:0 0 6px rgba(74,222,128,.6)}
+
+  /* ---- Macros (rotary knobs) ----------------------------------------- */
+  #macros .row{gap:14px;justify-content:flex-start}
+  #masterStack{display:flex;flex-direction:column;gap:8px}
+  .knob{align-items:center;min-width:64px}
+  .knob > label{text-align:center;max-width:66px}
+  .knobsvg{width:46px;height:46px;cursor:ns-resize;touch-action:none}
+  .knob .kbody{fill:#23272f;stroke:#2e333d;stroke-width:1}
+  .knob .karc{fill:none;stroke:#3a4150;stroke-width:3}
+  .knob .kval{fill:none;stroke:var(--accent2);stroke-width:3;stroke-linecap:round}
+  .knob .kptr{stroke:var(--accent);stroke-width:2.5;stroke-linecap:round}
+
+  /* ---- Tone overview strip ------------------------------------------- */
+  #tones{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .tcard{background:var(--panel);border:1px solid var(--edge);border-radius:var(--r);padding:8px 10px;cursor:pointer;transition:border-color .12s,background .12s}
+  .tcard:hover{border-color:var(--accent2)}
+  .tcard.sel{border-color:var(--accent);background:#22262e}
+  .tcard.dis{opacity:.55}
+  .tcard .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:6px}
+  .tcard .tname{font-weight:700;letter-spacing:.5px}
+  .tcard .wave{font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .tcard .mini{display:flex;flex-direction:column;gap:4px;margin-top:6px}
+
+  /* ---- Tone editor ---------------------------------------------------- */
+  /* Link-tones (subtractive) toggle — a standout bar under the panel title */
+  .linktoggle{display:flex;align-items:center;gap:11px;cursor:pointer;user-select:none;
+    margin:0 0 12px;padding:9px 12px;border-radius:var(--r);
+    background:var(--panel2);border:1px solid var(--edge);transition:border-color .12s,background .12s}
+  .linktoggle:hover{border-color:var(--accent)}
+  .linktoggle.on{background:rgba(255,138,61,.10);border-color:var(--accent)}
+  .linktoggle .led{flex:none;width:16px;height:16px;border-radius:50%;background:var(--off);
+    border:1px solid #000;transition:background .1s}
+  .linktoggle.on .led{background:var(--accent);box-shadow:0 0 8px rgba(255,138,61,.7)}
+  .linktoggle .lt-text{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+  .linktoggle .lt-title{font-size:12.5px;font-weight:700;color:var(--ink);letter-spacing:.2px}
+  .linktoggle.on .lt-title{color:var(--accent)}
+  .linktoggle .lt-sub{font-size:10.5px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .linktoggle .lt-state{flex:none;font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;
+    color:var(--dim);background:var(--bg);border:1px solid var(--edge);border-radius:20px;padding:3px 10px}
+  .linktoggle.on .lt-state{color:#16181d;background:var(--accent);border-color:var(--accent)}
+  /* "follows Tone 1" banner on slaved tones */
+  .linknote{grid-column:1 / -1;background:#1b1e24;border:1px dashed var(--edge);border-radius:var(--r);
+    padding:8px 10px;font-size:11px;color:var(--dim)}
+  .linknote b{color:var(--accent2);font-weight:700}
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tab{flex:1;text-align:center;padding:7px;border:1px solid var(--edge);border-radius:6px;
+    background:var(--panel2);cursor:pointer;font-weight:600}
+  .tab.sel{background:var(--accent);color:#16181d;border-color:var(--accent)}
+  .tab.dis .tag{color:var(--dim)}
+  .sections{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .sections .full{grid-column:1 / -1}
+  .sec{background:var(--panel2);border:1px solid var(--edge);border-radius:var(--r);padding:10px}
+  .sec > h3{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--accent2);font-weight:700}
+
+  /* ---- Envelope graph ------------------------------------------------- */
+  .env{display:flex;flex-direction:column;gap:6px}
+  .env svg{width:100%;height:96px;background:#171a1f;border:1px solid var(--edge);border-radius:6px;touch-action:none}
+  .env .pts{display:flex;gap:8px;flex-wrap:wrap}
+  /* Pitch/Filter/Amp: envelope (left) + sliders stacked (right) */
+  .envsplit{display:grid;grid-template-columns:minmax(190px,1fr) minmax(200px,1fr);gap:14px;align-items:start}
+  .envsplit .env{margin:0}
+  .envsplit .env svg{height:158px}
+  .envcol-r{display:flex;flex-direction:column;gap:10px}
+  .envcol-r .ctl{min-width:0;width:100%}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:7px 12px}
+  .env-node{fill:var(--accent);stroke:#16181d;stroke-width:2;cursor:grab}
+  .env-node:active{cursor:grabbing}
+  .env-line{fill:none;stroke:var(--accent2);stroke-width:2}
+  .env-fill{fill:rgba(77,177,255,.10)}
+
+  /* ---- Control matrix (Mod / Aftertouch / Expression) ---------------- */
+  .matrixgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .mxcell{display:flex;flex-direction:column;gap:7px;background:#1b1e24;
+    border:1px solid var(--edge);border-radius:6px;padding:8px}
+  .mxcell .ctl{min-width:0;width:100%}
+
+  @media (max-width:760px){ .sections{grid-template-columns:1fr} #tones{grid-template-columns:repeat(2,1fr)} .matrixgrid{grid-template-columns:repeat(2,1fr)} }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">MINI-JV <small>· JV-880 editor</small></div>
+    <div class="sep"></div>
+    <div class="preset">
+      <button class="nav" id="pPrev" title="Previous patch">◀</button>
+      <div class="name" id="pName">—</div>
+      <button class="nav" id="pNext" title="Next patch">▶</button>
+      <div class="idx" id="pIdx"></div>
+    </div>
+    <div class="sep"></div>
+    <div id="octWrap" class="ctl" style="min-width:120px"></div>
+    <button class="nav" id="syncBtn" title="Re-sync all values from the device">⟳ Sync</button>
+    <div id="status"><span id="dot"></span><span id="statusText">connecting…</span></div>
+  </header>
+
+  <main>
+    <section class="panel" id="macros">
+      <h2>Macros · offset all tones</h2>
+      <div class="fillrow" id="macroRow"></div>
+    </section>
+
+    <section class="panel" id="controlPanel">
+      <h2>Common / Control</h2>
+      <div id="control"></div>
+    </section>
+
+    <section class="panel" id="fxPanel">
+      <h2>Effects</h2>
+      <div id="effects"></div>
+    </section>
+
+    <section>
+      <div id="tones"></div>
+    </section>
+
+    <section class="panel" id="tonePanel">
+      <h2>Tone Editor</h2>
+      <div id="linkMount"></div>
+      <div class="tabs" id="toneTabs"></div>
+      <div class="sections" id="toneSections"></div>
+    </section>
+  </main>
+</div>
+
+<script src="/static/schwung-remote-api.js"></script>
+<script>
+"use strict";
+(function(){
+  // ===================================================================
+  // Host I/O via the schwungRemote API. schwung-manager serves
+  // /static/schwung-remote-api.js, which bridges to the device over
+  // shared-memory params (getParam is cached, setParam is fire-and-forget,
+  // onParamChange subscribes to pushes). Keys are component-prefixed
+  // "synth:<key>". The fallback shim lets the page render standalone for
+  // local preview when no host is present.
+  // ===================================================================
+  var PREFIX = "synth:";
+  var remote = window.schwungRemote || {
+    getParam: function(){ return Promise.resolve(""); },
+    setParam: function(){},
+    onParamChange: function(){},
+    getChainParams: function(){ return Promise.resolve(null); },
+    getHierarchy: function(){ return Promise.resolve(null); }
+  };
+  function setParamRaw(key, value){ remote.setParam(PREFIX+key, String(value)); }
+
+  // throttle param writes per key during drags (coalesce, always send last)
+  var sendTimers = {}, sendLast = {};
+  function setParam(key, value){
+    state.values[key] = String(value);
+    sendLast[key] = value;
+    if (sendTimers[key]) return;
+    setParamRaw(key, value);
+    sendTimers[key] = setTimeout(function(){
+      var t = sendTimers[key]; sendTimers[key]=null;
+      if (sendLast[key] !== value) setParamRaw(key, sendLast[key]);
+    }, 30);
+  }
+
+  // ===================================================================
+  // State
+  // ===================================================================
+  var state = {
+    params: {},        // bareKey -> metadata {key,name,type,min,max,step,options,display}
+    order: [],         // bareKey[] in declared order
+    values: {},        // bareKey -> string value
+    activeTone: 0,
+    linkMode: false,   // subtractive link: Tone 1 drives shared params on all tones
+    built: false
+  };
+  var controls = {};   // bareKey -> {update(val)} refresh hooks (many per key allowed)
+  function onValue(key, fn){ (controls[key]||(controls[key]=[])).push(fn); }
+  function pushValue(key, val){
+    state.values[key] = val;
+    var hooks = controls[key]; if(!hooks) return;
+    for (var i=0;i<hooks.length;i++){ try{ hooks[i](val); }catch(e){} }
+  }
+
+  // ===================================================================
+  // Param classification (data-driven; scales as chain_params grows)
+  // ===================================================================
+  var TONE_RE = /^nvram_tone_(\d)_(.+)$/;
+  var MACRO_KEYS = ["macro_cutoff","macro_resonance","macro_attack","macro_decay",
+                    "macro_sustain","macro_release","macro_tvf_env_depth","macro_lfo_depth"];
+  // Common / Control panel — two labeled sub-rows.
+  var PC = "nvram_patchCommon_";
+  var CONTROL_VOICE = [PC+"patchlevel",PC+"patchpan",PC+"analogfeel",
+                       PC+"keyassign",PC+"sololegato",PC+"velocityswitch"];
+  var CONTROL_BEND  = [PC+"bendrangeup",PC+"bendrangedown",PC+"portamentoswitch",
+                       PC+"portamentomode",PC+"portamentotype",PC+"portamentotime"];
+  // Effects panel — reverb cluster + chorus cluster.
+  var FX_REVERB = [PC+"reverbtype",PC+"reverblevel",PC+"reverbtime",PC+"reverbfeedback"];
+  var FX_CHORUS = [PC+"chorustype",PC+"choruslevel",PC+"chorusdepth",
+                   PC+"chorusrate",PC+"chorusfeedback",PC+"chorusoutput"];
+
+  // Which tone section a per-tone suffix belongs to.
+  function toneSection(suffix){
+    if (/^mod(dest|sens)/.test(suffix)) return "Mod";
+    if (/^aft(dest|sens)/.test(suffix)) return "Aftertouch";
+    if (/^exp(dest|sens)/.test(suffix)) return "Expression";
+    if (/^lfo1/.test(suffix)) return "LFO 1";
+    if (/^lfo2/.test(suffix)) return "LFO 2";
+    if (/^(penv|pitch|randompitch)/.test(suffix)) return "Pitch";
+    if (/^(tvf|cutoff|resonance|filtermode)/.test(suffix)) return "Filter";
+    if (/^(tva|level|pan|drylevel|reverbsend|chorussend|bias)/.test(suffix)) return "Amp";
+    if (/^(wave|fxm|toneswitch)/.test(suffix)) return "Wave";
+    return "More";
+  }
+  // The three control-matrix sections: each holds 4 slots (A–D), every slot a
+  // Dest enum + signed Sens. prefix = the suffix stem (mod/aft/exp).
+  var MATRIX_SECTIONS = {"Mod":"mod","Aftertouch":"aft","Expression":"exp"};
+
+  // Subtractive link mode: per-tone "oscillator" suffixes stay independent on
+  // every tone; everything else is shared and driven by Tone 1. Mirrors the
+  // device's v2_is_shared_tone_param so the UI hides exactly what the engine links.
+  var PER_TONE_SUFFIX = {wavegroup:1,wavenumber:1,fxmswitch:1,fxmdepth:1,toneswitch:1,
+    pitchcoarse:1,pitchfine:1,randompitchdepth:1,pitchkeyfollow:1,
+    level:1,pan:1,levelkeyfollow:1,panningkeyfollow:1};
+  function isSharedSuffix(suffix){ return !PER_TONE_SUFFIX[suffix]; }
+  // suffixes the envelope graph already covers — hidden from the numeric grid
+  // (depth/velocity stay visible as plain controls).
+  var ENV_TIME = {Pitch:["penvtime1","penvtime2","penvtime3","penvtime4"],
+                  Filter:["tvfenvtime1","tvfenvtime2","tvfenvtime3","tvfenvtime4"],
+                  Amp:["tvaenvtime1","tvaenvtime2","tvaenvtime3","tvaenvtime4"]};
+  var ENV_LEVEL = {Pitch:["penvlevel1","penvlevel2","penvlevel3","penvlevel4"],
+                   Filter:["tvfenvlevel1","tvfenvlevel2","tvfenvlevel3","tvfenvlevel4"],
+                   Amp:["tvaenvlevel1","tvaenvlevel2","tvaenvlevel3"]};
+  function isEnvSuffix(sec, suffix){
+    return (ENV_TIME[sec]&&ENV_TIME[sec].indexOf(suffix)>=0) ||
+           (ENV_LEVEL[sec]&&ENV_LEVEL[sec].indexOf(suffix)>=0);
+  }
+  var SECTION_ORDER = ["Wave","Pitch","Filter","Amp","LFO 1","LFO 2",
+                       "Mod","Aftertouch","Expression","More"];
+  // Wave/Pitch/Filter/Amp + the 3 matrix sections span the full row;
+  // LFO 1 & LFO 2 pair up side by side.
+  var SECTION_FULL = {Wave:true, Pitch:true, Filter:true, Amp:true,
+                      Mod:true, Aftertouch:true, Expression:true};
+
+  // ===================================================================
+  // DOM helpers
+  // ===================================================================
+  function el(tag, cls, txt){ var e=document.createElement(tag); if(cls)e.className=cls; if(txt!=null)e.textContent=txt; return e; }
+  function num(x){ var n=parseFloat(x); return isNaN(n)?0:n; }
+  function meta(key){ return state.params[key]; }
+
+  // Append a labeled sub-group (heading + a full-width fillrow of controls) to a
+  // panel body. Controls whose keys aren't present in chain_params are skipped.
+  function fillGroup(host, label, keys){
+    var any=false, row=el("div","fillrow");
+    keys.forEach(function(k){ var c=makeControl(k); if(c){ row.appendChild(c); any=true; } });
+    if (!any) return;
+    if (label) host.appendChild(el("div","grouplabel",label));
+    host.appendChild(row);
+  }
+
+  // Build one control bound to a param key. Returns the DOM node (or null).
+  function makeControl(key, labelOverride){
+    var m = meta(key); if(!m) return null;
+    var wrap = el("div","ctl");
+    var lab = el("label", null, labelOverride || m.name || key);
+    lab.title = lab.textContent; wrap.appendChild(lab);
+
+    if (m.type === "enum" && m.options && m.options.length){
+      // boolean Off/On -> LED toggle; otherwise dropdown
+      if (m.options.length === 2 && /off/i.test(m.options[0]) && /on/i.test(m.options[1])){
+        var sw = el("div","sw"); sw.appendChild(el("span","led"));
+        sw.appendChild(el("span",null,""));
+        var refresh = function(v){ var on = num(v)>=1; sw.classList.toggle("on",on); sw.lastChild.textContent = on?"On":"Off"; };
+        sw.onclick = function(){ var on = !sw.classList.contains("on"); setParam(key, on?1:0); refresh(on?1:0); };
+        wrap.appendChild(sw); onValue(key, refresh); refresh(state.values[key]||0);
+        return wrap;
+      }
+      var sel = el("select");
+      m.options.forEach(function(o,i){ var op=el("option",null,o); op.value=i; sel.appendChild(op); });
+      sel.onchange = function(){ setParam(key, sel.value); };
+      onValue(key, function(v){ sel.value = String(num(v)); });
+      sel.value = String(num(state.values[key]||0));
+      wrap.appendChild(sel); return wrap;
+    }
+
+    // numeric: slider + tabular readout
+    var line = el("div","line");
+    var rng = el("input"); rng.type="range";
+    rng.min = (m.min!=null?m.min:0); rng.max = (m.max!=null?m.max:127);
+    rng.step = m.step || 1;
+    if (num(m.min) < 0) rng.classList.add("signed");
+    var val = el("span","val");
+    var fmt = function(v){ var n=Math.round(num(v)); return (num(m.min)<0&&n>0?"+":"")+n; };
+    rng.oninput = function(){ setParam(key, rng.value); val.textContent = fmt(rng.value); };
+    onValue(key, function(v){ rng.value = num(v); val.textContent = fmt(v); });
+    line.appendChild(rng); line.appendChild(val);
+    wrap.appendChild(line);
+    var iv = state.values[key]; rng.value = num(iv); val.textContent = fmt(iv);
+    return wrap;
+  }
+
+  // ===================================================================
+  // Rotary knob widget (macros). Drag vertically (or wheel) to change.
+  // ===================================================================
+  var SVGNS="http://www.w3.org/2000/svg";
+  function polarTop(cx,cy,r,deg){ var a=deg*Math.PI/180; return [cx+r*Math.sin(a), cy-r*Math.cos(a)]; }
+  function arcPath(r,fromDeg,toDeg){
+    var a=polarTop(24,24,r,fromDeg), b=polarTop(24,24,r,toDeg), large=(toDeg-fromDeg)>180?1:0;
+    return "M"+a[0].toFixed(2)+","+a[1].toFixed(2)+" A"+r+","+r+" 0 "+large+" 1 "+b[0].toFixed(2)+","+b[1].toFixed(2);
+  }
+  function makeKnob(key,labelOverride){
+    var m=meta(key); if(!m) return null;
+    var min=num(m.min!=null?m.min:0), max=num(m.max!=null?m.max:127); if(max<=min) max=min+1;
+    var signed=(min<0);
+    var wrap=el("div","ctl knob");
+    var lab=el("label",null,labelOverride||m.name||key); lab.title=lab.textContent; wrap.appendChild(lab);
+    var svg=document.createElementNS(SVGNS,"svg"); svg.setAttribute("viewBox","0 0 48 48"); svg.setAttribute("class","knobsvg");
+    var body=document.createElementNS(SVGNS,"circle"); body.setAttribute("cx",24); body.setAttribute("cy",24); body.setAttribute("r",18); body.setAttribute("class","kbody"); svg.appendChild(body);
+    var track=document.createElementNS(SVGNS,"path"); track.setAttribute("class","karc"); track.setAttribute("d",arcPath(15,-135,135)); svg.appendChild(track);
+    var vArc=document.createElementNS(SVGNS,"path"); vArc.setAttribute("class","kval"); svg.appendChild(vArc);
+    var ptr=document.createElementNS(SVGNS,"line"); ptr.setAttribute("class","kptr"); ptr.setAttribute("x1",24); ptr.setAttribute("y1",24); svg.appendChild(ptr);
+    wrap.appendChild(svg);
+    var val=el("span","val"); wrap.appendChild(val);
+    function setVisual(v){
+      var frac=(v-min)/(max-min); if(frac<0)frac=0; if(frac>1)frac=1;
+      var deg=-135+frac*270, pe=polarTop(24,24,15,deg);
+      ptr.setAttribute("x2",pe[0].toFixed(2)); ptr.setAttribute("y2",pe[1].toFixed(2));
+      vArc.setAttribute("d",arcPath(15,-135,deg));
+      val.textContent=(signed&&v>0?"+":"")+Math.round(v);
+    }
+    onValue(key,function(v){ setVisual(num(v)); });
+    setVisual(num(state.values[key]!==undefined?state.values[key]:min));
+    var dragging=false,startY=0,startV=0;
+    function curV(){ return num(state.values[key]!==undefined?state.values[key]:min); }
+    function down(ev){ dragging=true; startY=ev.clientY; startV=curV(); if(svg.setPointerCapture)svg.setPointerCapture(ev.pointerId); ev.preventDefault(); }
+    function move(ev){ if(!dragging)return; var nv=Math.round(startV+(startY-ev.clientY)*(max-min)/150); nv=Math.max(min,Math.min(max,nv)); setParam(key,nv); setVisual(nv); }
+    function up(){ dragging=false; }
+    svg.addEventListener("pointerdown",down); svg.addEventListener("pointermove",move);
+    svg.addEventListener("pointerup",up); svg.addEventListener("pointercancel",up);
+    svg.addEventListener("wheel",function(ev){ ev.preventDefault(); var nv=Math.max(min,Math.min(max,curV()+(ev.deltaY<0?1:-1))); setParam(key,nv); setVisual(nv); },{passive:false});
+    return wrap;
+  }
+
+  // ===================================================================
+  // Envelope widget — graphical, draggable nodes (time = x, level = y).
+  // cfg: {section, times:[keys], levels:[keys], startLevel, endLevel}
+  // levels may be null (= implicit 0). Times/levels read live param ranges.
+  // ===================================================================
+  function makeEnvelope(toneIdx, section){
+    var timeSfx = ENV_TIME[section], levSfx = ENV_LEVEL[section];
+    if (!timeSfx || !levSfx) return null;
+    var pre = "nvram_tone_"+toneIdx+"_";
+    // resolve actual keys present
+    var times = timeSfx.map(function(s){return pre+s;}).filter(function(k){return meta(k);});
+    var levels = levSfx.map(function(s){return pre+s;}).filter(function(k){return meta(k);});
+    if (!times.length) return null;
+    var stages = Math.max(times.length, levels.length);
+    // level range from metadata (filter/amp 0..127; pitch signed -63..63)
+    var lm = levels.length?meta(levels[0]):null;
+    var LMIN = lm?num(lm.min):0, LMAX = lm?num(lm.max):127;
+    var TMAX = num((meta(times[0])||{}).max||127);
+
+    var W=560, H=96, padL=6, padR=6, padT=10, padB=12;
+    var ix0=padL, ix1=W-padR, iy0=padT, iy1=H-padB;
+    var svg = document.createElementNS("http://www.w3.org/2000/svg","svg");
+    svg.setAttribute("viewBox","0 0 "+W+" "+H); svg.setAttribute("preserveAspectRatio","none");
+    var fillEl = document.createElementNS("http://www.w3.org/2000/svg","path"); fillEl.setAttribute("class","env-fill");
+    var lineEl = document.createElementNS("http://www.w3.org/2000/svg","path"); lineEl.setAttribute("class","env-line");
+    // baseline at level=0 for signed envs
+    var zeroY = (LMIN<0) ? (iy1 - ( (0-LMIN)/(LMAX-LMIN) )*(iy1-iy0)) : iy1;
+    var zline = document.createElementNS("http://www.w3.org/2000/svg","line");
+    zline.setAttribute("x1",ix0); zline.setAttribute("x2",ix1);
+    zline.setAttribute("y1",zeroY); zline.setAttribute("y2",zeroY);
+    zline.setAttribute("stroke","#2a2f38"); zline.setAttribute("stroke-dasharray","3 4");
+    svg.appendChild(zline); svg.appendChild(fillEl); svg.appendChild(lineEl);
+
+    var nodes=[];
+    function levOf(i){ return levels[i]?num(state.values[levels[i]]||0):0; }
+    function timeOf(i){ return num(state.values[times[i]]||0); }
+    function L2Y(v){ return iy1 - ((v-LMIN)/(LMAX-LMIN))*(iy1-iy0); }
+    // Absolute time->x mapping: each stage owns a fixed slice of the width (up to
+    // TMAX), so a node's screen position depends only on the cumulative time up to
+    // it — never on the live total. This keeps a dragged node tracking the cursor
+    // 1:1 and shifts later nodes rigidly, instead of the springy normalize-by-total
+    // behavior that made nodes snap to the next point or to the far edge.
+    var FULLT = Math.max(1, times.length) * TMAX;
+    function geom(){
+      var span=ix1-ix0;
+      var pts=[{x:ix0,y:L2Y(LMIN<0?0:0)}], acc=0, i; // start at level 0
+      for(i=0;i<stages;i++){
+        acc+=timeOf(i);
+        pts.push({x:ix0+span*Math.min(1,acc/FULLT), y:L2Y(levOf(i))});
+      }
+      // Hold tail: after the final stage the envelope holds at its last level
+      // (pitch/filter sustain; amp rests at 0), so extend the line+fill flat to
+      // the right edge instead of leaving the graph dangling mid-canvas. The tail
+      // carries no breakpoint dot — only the real nodes (pts[1..stages]) do.
+      var lastP=pts[pts.length-1];
+      if (lastP.x < ix1) pts.push({x:ix1, y:lastP.y});
+      return pts;
+    }
+    function redraw(){
+      var pts=geom(), d="M"+pts[0].x+","+pts[0].y, i;
+      for(i=1;i<pts.length;i++) d+=" L"+pts[i].x+","+pts[i].y;
+      lineEl.setAttribute("d", d);
+      fillEl.setAttribute("d", d+" L"+pts[pts.length-1].x+","+iy1+" L"+pts[0].x+","+iy1+" Z");
+      // The viewBox is stretched non-uniformly (preserveAspectRatio=none), so a
+      // circle would render as an ellipse. Counter-scale rx/ry by the live pixel
+      // ratio so the breakpoint dots stay round at any size.
+      var rect=svg.getBoundingClientRect();
+      var rx=rect.width>0?(6*W/rect.width):6, ry=rect.height>0?(6*H/rect.height):6;
+      for(i=0;i<stages;i++){ var p=pts[i+1]; if(nodes[i]){
+        nodes[i].setAttribute("cx",p.x); nodes[i].setAttribute("cy",p.y);
+        nodes[i].setAttribute("rx",rx); nodes[i].setAttribute("ry",ry);
+      } }
+    }
+    function vbX(ev){ var r=svg.getBoundingClientRect(); return (ev.clientX-r.left)/r.width*W; }
+    function vbY(ev){ var r=svg.getBoundingClientRect(); return (ev.clientY-r.top)/r.height*H; }
+    for(var s=0;s<stages;s++){
+      (function(i){
+        var c=document.createElementNS("http://www.w3.org/2000/svg","ellipse");
+        c.setAttribute("class","env-node"); c.setAttribute("vector-effect","non-scaling-stroke");
+        nodes[i]=c; svg.appendChild(c);
+        var dragging=false, startX=0, startT=0;
+        function down(ev){ dragging=true; startX=vbX(ev); startT=times[i]?timeOf(i):0;
+          if(c.setPointerCapture) c.setPointerCapture(ev.pointerId); ev.preventDefault(); }
+        function move(ev){
+          if(!dragging) return;
+          // vertical drag -> level
+          if(levels[i]){
+            var lv = LMAX - ((vbY(ev)-iy0)/(iy1-iy0))*(LMAX-LMIN);
+            lv = Math.max(LMIN, Math.min(LMAX, Math.round(lv)));
+            setParam(levels[i],lv); pushLocal(levels[i],lv);
+          }
+          // horizontal drag -> this stage's time (delta mapped over full width)
+          if(times[i]){
+            var dt = Math.round((vbX(ev)-startX)/(ix1-ix0)*FULLT);
+            var tv = Math.max(0, Math.min(TMAX, startT+dt));
+            setParam(times[i],tv); pushLocal(times[i],tv);
+          }
+          redraw();
+        }
+        function up(){ dragging=false; }
+        c.addEventListener("pointerdown",down);
+        c.addEventListener("pointermove",move);
+        c.addEventListener("pointerup",up);
+        c.addEventListener("pointercancel",up);
+      })(s);
+    }
+    function pushLocal(key,v){ state.values[key]=String(v); var hk=controls[key]; if(hk)for(var j=0;j<hk.length;j++){try{hk[j](v);}catch(e){}} }
+
+    // live refresh when values arrive from device
+    times.concat(levels).forEach(function(k){ onValue(k, function(){ redraw(); }); });
+
+    var box=el("div","env");
+    box.appendChild(svg);
+    setTimeout(redraw,0);
+    // Redraw on size changes so the dots' counter-scaling stays correct.
+    if (window.ResizeObserver){ new ResizeObserver(function(){ redraw(); }).observe(svg); }
+    return box;
+  }
+
+  // ===================================================================
+  // Build the whole UI from chain_params
+  // ===================================================================
+  function build(){
+    if (state.built) return;
+    state.built = true;
+
+    // -- Octave (header) --
+    var oct = makeControl("octave_transpose","Octave");
+    if (oct) document.getElementById("octWrap").appendChild(oct);
+
+    // -- Macros (rendered as rotary knobs — they map to the device's knobs) --
+    var mrow = document.getElementById("macroRow");
+    MACRO_KEYS.forEach(function(k){ var c=makeKnob(k); if(c) mrow.appendChild(c); });
+
+    // -- Common / Control: voice + bend/portamento sub-groups --
+    var ctlHost = document.getElementById("control");
+    fillGroup(ctlHost, "Voice", CONTROL_VOICE);
+    fillGroup(ctlHost, "Bend / Portamento", CONTROL_BEND);
+
+    // -- Effects: reverb + chorus sub-groups --
+    var fxHost = document.getElementById("effects");
+    fillGroup(fxHost, "Reverb", FX_REVERB);
+    fillGroup(fxHost, "Chorus", FX_CHORUS);
+
+    // -- Tone overview cards --
+    buildToneCards();
+
+    // -- Tone tabs --
+    var tabs = document.getElementById("toneTabs");
+    for (var t=0;t<4;t++){
+      (function(idx){
+        var b=el("div","tab"); b.id="tab"+idx;
+        b.innerHTML = "Tone "+(idx+1)+' <span class="tag muted"></span>';
+        b.onclick=function(){ selectTone(idx); };
+        tabs.appendChild(b);
+      })(t);
+    }
+
+    // -- Link-tones (subtractive) toggle --
+    buildLinkToggle();
+
+    selectTone(0);
+  }
+
+  // The subtractive-link toggle. Bound to the device's link_tones param: turning
+  // it on makes Tone 1 drive every shared param across all tones (the device
+  // snaps Tone 1 -> tones 2-4 and broadcasts subsequent edits). We mirror the
+  // device's auto-disable on patch change locally (see applyParamUpdate).
+  var linkSwEl = null, linkStateEl = null;
+  function buildLinkToggle(){
+    var mount = document.getElementById("linkMount"); if(!mount) return;
+    var t = el("label","linktoggle"); t.title =
+      "Subtractive mode: Tone 1 controls the filter, envelopes, LFOs & matrix on every tone. Each tone keeps its own wave, tuning and level/pan.";
+    t.appendChild(el("span","led"));
+    var txt = el("div","lt-text");
+    txt.appendChild(el("div","lt-title","Link Tones"));
+    txt.appendChild(el("div","lt-sub","Tone 1 drives filter, envelopes, LFOs & matrix on all tones"));
+    t.appendChild(txt);
+    linkStateEl = el("span","lt-state","Off"); t.appendChild(linkStateEl);
+    t.onclick = function(){ setLinkMode(!state.linkMode, true); };
+    mount.appendChild(t); linkSwEl = t;
+    onValue("link_tones", function(v){ setLinkMode(num(v)>=1, false); });
+    updateLinkToggle();
+  }
+  function updateLinkToggle(){
+    if(linkSwEl) linkSwEl.classList.toggle("on", state.linkMode);
+    if(linkStateEl) linkStateEl.textContent = state.linkMode ? "On" : "Off";
+  }
+
+  // Apply a link-mode change. fromUser=true means the user clicked (push to
+  // device + re-pull snapped values); otherwise it's reflecting a device push.
+  function setLinkMode(on, fromUser){
+    on = !!on;
+    if (state.linkMode === on){ updateLinkToggle(); return; }
+    state.linkMode = on;
+    updateLinkToggle();
+    if (fromUser) setParam("link_tones", on?1:0);
+    if (state.built) renderToneSections(state.activeTone);
+    // A user toggle changes many tone params at once on the device (enable snaps
+    // Tone 1 -> others; the slaved values are revealed again on disable), outside
+    // the normal per-edit echo. Re-sync from the device so the editor matches.
+    if (fromUser) setTimeout(resyncFromDevice, 200);
+  }
+
+  // Re-pull current device state (same mechanism as the ⟳ Sync button): the host
+  // re-pushes the full param set on every subscribe, which refreshes any values
+  // that changed device-side outside a UI edit (e.g. the link snap/broadcast).
+  function resyncFromDevice(){
+    try{ window.parent.postMessage({type:"subscribe"},"*"); }catch(e){}
+  }
+
+  function buildToneCards(){
+    var host=document.getElementById("tones"); host.innerHTML="";
+    for (var t=0;t<4;t++){
+      (function(idx){
+        var pre="nvram_tone_"+idx+"_";
+        var card=el("div","tcard"); card.id="tcard"+idx;
+        var top=el("div","top");
+        top.appendChild(el("span","tname","TONE "+(idx+1)));
+        var swKey=pre+"toneswitch";
+        if (meta(swKey)){
+          var sw=el("span","sw"); sw.appendChild(el("span","led"));
+          var rf=function(v){ var on=num(v)>=1; sw.classList.toggle("on",on); card.classList.toggle("dis",!on); };
+          sw.onclick=function(ev){ ev.stopPropagation(); var on=!sw.classList.contains("on"); setParam(swKey,on?1:0); rf(on?1:0); };
+          onValue(swKey,rf); rf(state.values[swKey]||0); top.appendChild(sw);
+        }
+        card.appendChild(top);
+        var wave=el("div","wave","—");
+        var wnKey=pre+"wavenumber", wgKey=pre+"wavegroup";
+        function updWave(){
+          var gm=meta(wgKey), g = gm && gm.options ? (gm.options[num(state.values[wgKey]||0)]||"") : "";
+          wave.textContent = (g?g+" ":"") + "#" + num(state.values[wnKey]||0);
+        }
+        if (meta(wnKey)) onValue(wnKey,updWave);
+        if (meta(wgKey)) onValue(wgKey,updWave);
+        card.appendChild(wave);
+        var mini=el("div","mini");
+        ["level","pan"].forEach(function(s){ var c=makeControl(pre+s); if(c){c.style.minWidth="0";c.style.flex="1";mini.appendChild(c);} });
+        card.appendChild(mini);
+        card.onclick=function(){ selectTone(idx); };
+        host.appendChild(card);
+      })(t);
+    }
+  }
+
+  function selectTone(idx){
+    state.activeTone=idx;
+    for (var t=0;t<4;t++){
+      var tab=document.getElementById("tab"+t); if(tab) tab.classList.toggle("sel",t===idx);
+      var card=document.getElementById("tcard"+t); if(card) card.classList.toggle("sel",t===idx);
+    }
+    renderToneSections(idx);
+  }
+
+  // group this tone's params by section
+  function renderToneSections(idx){
+    var host=document.getElementById("toneSections"); host.innerHTML="";
+    var pre="nvram_tone_"+idx+"_";
+    // In link mode, tones 2-4 are slaves: only their per-tone (oscillator) params
+    // are editable; the shared sections are hidden (they follow Tone 1).
+    var linkSlave = state.linkMode && idx>0;
+    if (linkSlave){
+      var note=el("div","linknote");
+      note.innerHTML = "Filter, envelopes, LFOs & control matrix follow <b>Tone 1</b>. "+
+                       "This tone keeps its own wave, tuning and level/pan.";
+      host.appendChild(note);
+    } else if (state.linkMode && idx===0){
+      var note0=el("div","linknote");
+      note0.innerHTML = "<b>Subtractive mode</b> — editing Tone 1's filter, envelopes, "+
+                        "LFOs & matrix drives all four tones.";
+      host.appendChild(note0);
+    }
+    var bySec={};
+    state.order.forEach(function(key){
+      var m=key.match(TONE_RE); if(!m||+m[1]!==idx) return;
+      var suffix=m[2];
+      if (linkSlave && isSharedSuffix(suffix)) return;  // hidden on slave tones
+      var sec=toneSection(suffix);
+      (bySec[sec]||(bySec[sec]=[])).push({key:key,suffix:suffix});
+    });
+    SECTION_ORDER.forEach(function(sec){
+      var items=bySec[sec]; if(!items) return;
+      var box=el("div","sec"+(SECTION_FULL[sec]?" full":"")); box.appendChild(el("h3",null,sec));
+
+      // Control matrix: 4 slots (A–D), each a Dest enum stacked over signed Sens.
+      if (MATRIX_SECTIONS[sec]){
+        var stem=MATRIX_SECTIONS[sec], mg=el("div","matrixgrid");
+        ["a","b","c","d"].forEach(function(L){
+          var cell=el("div","mxcell"), U=L.toUpperCase();
+          var d=makeControl(pre+stem+"dest"+L,"Dest "+U);
+          var s=makeControl(pre+stem+"sens"+L,"Sens "+U);
+          if(d) cell.appendChild(d);
+          if(s) cell.appendChild(s);
+          if(cell.childNodes.length) mg.appendChild(cell);
+        });
+        box.appendChild(mg); host.appendChild(box); return;
+      }
+
+      // Slave tones never show the shared envelope graphs (their time/level
+      // params belong to Tone 1); Pitch/Amp then fall through to a plain row of
+      // the remaining per-tone controls (tuning / level-pan).
+      var env = linkSlave ? null : makeEnvelope(idx,sec);
+      if (env){
+        // Pitch/Filter/Amp: envelope on the left; sliders on the right in two
+        // columns. Envelope stages are paired Tn | Ln per row using the fixed
+        // ENV_TIME/ENV_LEVEL order, so alignment holds regardless of the order
+        // the params arrive in.
+        var split=el("div","envsplit");
+        split.appendChild(env);
+        var right=el("div","envcol-r");
+        var tset=(ENV_TIME[sec]||[]).map(function(s){return pre+s;});
+        var lset=(ENV_LEVEL[sec]||[]).map(function(s){return pre+s;});
+        var envSet={}; tset.concat(lset).forEach(function(k){envSet[k]=1;});
+        // non-envelope controls (depth, cutoff, mode, …) — two columns, in order
+        var og=el("div","grid2");
+        items.forEach(function(it){ if(envSet[it.key])return; var c=makeControl(it.key); if(c) og.appendChild(c); });
+        if (og.childNodes.length) right.appendChild(og);
+        // envelope stages — one row per stage: Tn (left) | Ln (right)
+        var sg=el("div","grid2"), n=Math.max(tset.length,lset.length);
+        for (var i=0;i<n;i++){
+          sg.appendChild(meta(tset[i]) ? makeControl(tset[i],"T"+(i+1)) : el("div"));
+          sg.appendChild(meta(lset[i]) ? makeControl(lset[i],"L"+(i+1)) : el("div"));
+        }
+        if (sg.childNodes.length) right.appendChild(sg);
+        split.appendChild(right);
+        box.appendChild(split);
+      } else {
+        // Wave: distribute full width. LFO: simple wrapping row (half-width block).
+        var grid=el("div", sec==="Wave"?"fillrow":"row");
+        items.forEach(function(it){ var c=makeControl(it.key); if(c) grid.appendChild(c); });
+        box.appendChild(grid);
+      }
+      host.appendChild(box);
+    });
+  }
+
+  // ===================================================================
+  // Preset browser
+  // ===================================================================
+  function refreshPreset(){
+    var idx=num(state.values["preset"]), cnt=num(state.values["preset_count"]);
+    document.getElementById("pName").textContent = state.values["preset_name"] || ("Patch "+idx);
+    document.getElementById("pIdx").textContent = cnt? (idx+1)+" / "+cnt : "";
+  }
+  function stepPreset(d){
+    var idx=num(state.values["preset"]), cnt=num(state.values["preset_count"])||1;
+    idx=(idx+d+cnt)%cnt; setParam("preset",idx); state.values["preset"]=String(idx); refreshPreset();
+    if (state.linkMode) setLinkMode(false, false);  // patch load auto-disables link
+  }
+  document.getElementById("pPrev").onclick=function(){ stepPreset(-1); };
+  document.getElementById("pNext").onclick=function(){ stepPreset(1); };
+
+  // Manual Sync — re-fire the subscribe (the host re-pushes full state on every
+  // subscribe) and re-pull cached values. Recovers from any missed device→UI
+  // drift without a reload.
+  document.getElementById("syncBtn").onclick=function(){
+    try{ window.parent.postMessage({type:"subscribe"},"*"); }catch(e){}
+    if (state.built) seedValues();
+    setStatus("synced","ok");
+  };
+
+  // ===================================================================
+  // Inbound messages from parent
+  // ===================================================================
+  function ingestChainParams(data){
+    if (!data) return;
+    if (typeof data === "string"){ try{ data=JSON.parse(data); }catch(e){ return; } }
+    if (!Array.isArray(data)) return;
+    state.params={}; state.order=[];
+    data.forEach(function(p){
+      if(!p||!p.key) return;
+      state.params[p.key]=p; state.order.push(p.key);
+    });
+    build();
+  }
+
+  function applyParamUpdate(params){
+    if (!params) return;
+    var touchedPreset=false, patchChanged=false;
+    Object.keys(params).forEach(function(fullKey){
+      var key = fullKey.indexOf(PREFIX)===0 ? fullKey.slice(PREFIX.length) : fullKey;
+      pushValue(key, params[fullKey]);
+      if (key==="preset"||key==="preset_name"||key==="preset_count") touchedPreset=true;
+      if (key==="preset") patchChanged=true;
+    });
+    if (touchedPreset) refreshPreset();
+    // A patch load auto-disables link on the device (so the new patch arrives
+    // intact); reflect that here since the device doesn't push link_tones back.
+    if (patchChanged && state.linkMode) setLinkMode(false, false);
+  }
+
+  function setStatus(txt, cls){
+    document.getElementById("statusText").textContent=txt;
+    var d=document.getElementById("dot"); d.className=cls||"";
+  }
+
+  // ===================================================================
+  // Boot: subscribe, pull chain_params, then seed current values.
+  // ===================================================================
+  async function boot(){
+    setStatus("connecting…","");
+    remote.onParamChange(applyParamUpdate);   // subscribe + receive live pushes
+    // Retry getChainParams a few times — chain_params arrive from the device
+    // asynchronously and the iframe can boot before they land.
+    var cp=null;
+    for (var attempt=0; attempt<6 && !cp; attempt++){
+      cp = await remote.getChainParams();
+      if (!cp) await new Promise(function(r){setTimeout(r,600);});
+    }
+    if (!cp){ setStatus("no module in slot","err"); return; }
+    ingestChainParams(cp);
+    setStatus("connected","ok");
+    seedValues();
+  }
+
+  function seedValues(){
+    // Seed current values from the host's param cache (getParam is cached, not
+    // a fresh device read). onParamChange covers live changes after this. Only
+    // fetch keys not already populated by a push. preset_name/preset_count are
+    // get_param-only meta keys (absent from chain_params), fetched explicitly.
+    ["preset_name","preset_count"].forEach(function(k){
+      remote.getParam(PREFIX+k).then(function(v){ if(v!=null&&v!==""){ state.values[k]=String(v); refreshPreset(); } });
+    });
+    var keys = state.order.slice();
+    var i=0;
+    function next(){
+      var batch=0;
+      while(i<keys.length && batch<24){
+        var k=keys[i++];
+        if (state.values[k]!==undefined) continue;   // already arrived via a push
+        (function(k){
+          remote.getParam(PREFIX+k).then(function(v){
+            if(v!=null&&v!==""){ pushValue(k,v); if(k==="preset") refreshPreset(); }
+          });
+        })(k);
+        batch++;
+      }
+      if (i<keys.length) setTimeout(next, 20);
+    }
+    next();
+  }
+
+  boot();
+})();
+</script>
+</body>
+</html>
