@@ -546,6 +546,9 @@ static void extract_expansion_name(const char *filename, char *name, int max_len
  * performance issues on limited hardware.
  * ======================================================================== */
 
+/* Tone param cache size - 4 tones × 84 bytes each. Per-instance (see struct). */
+#define TONE_CACHE_SIZE (4 * 84)
+
 /* v2 instance structure containing ALL state (for true multi-instance) */
 typedef struct {
     /* Module path */
@@ -693,6 +696,22 @@ typedef struct {
      * param across all four tones. Transient editing mode — reset on patch change. */
     int link_tones;
 
+    /* Link-mode backup: holds the original shared (non-oscillator) bytes of
+     * tones 2,3,4 as they were before link snapped Tone 1 over them, so the
+     * toggle is reversible. Stored as the full 84-byte tone slice for tones
+     * 2,3,4 (only the shared bytes are touched on restore via v2_snap_link_tones'
+     * param set). link_backup_valid==1 means a valid snapshot is held. */
+    uint8_t link_backup[3 * 84];
+    int link_backup_valid;
+
+    /* Per-instance tone param cache - avoid hitting NVRAM on every poll.
+     * tone_cache_valid is the wall-clock timestamp (ms) when the cache was
+     * filled; 0 means invalid. MUST be per-instance: a process-global cache
+     * lets one JV-880 slot serve another slot's stale NVRAM bytes, corrupting
+     * serialized patches across slots. */
+    uint8_t tone_cache[TONE_CACHE_SIZE];
+    uint64_t tone_cache_valid;
+
 #if JV880_PERF_STATS
     /* Per-window accumulators (reset every 15-second report window) */
     uint64_t perf_ns_emu;         /* Thread CPU ns spent in updateSC55 */
@@ -735,6 +754,7 @@ static void v2_send_all_notes_off(jv880_instance_t *inst);
 static void v2_set_param(void *instance, const char *key, const char *val);
 static int v2_get_param(void *instance, const char *key, char *buf, int buf_len);
 static void v2_snap_link_tones(jv880_instance_t *inst);
+static void v2_restore_link_tones(jv880_instance_t *inst);
 
 /* v2: Get file size helper */
 static uint32_t v2_get_file_size(const char *path) {
@@ -1044,6 +1064,7 @@ static int v2_load_expansion_data(jv880_instance_t *inst, int exp_index) {
 
 /* v2: Send all notes off */
 static void v2_send_all_notes_off(jv880_instance_t *inst) {
+    pthread_mutex_lock(&inst->ring_mutex);
     for (int ch = 0; ch < 16; ch++) {
         uint8_t msg[3] = { (uint8_t)(0xB0 | ch), 123, 0 };
         int next = (inst->midi_write + 1) % MIDI_QUEUE_SIZE;
@@ -1053,6 +1074,7 @@ static void v2_send_all_notes_off(jv880_instance_t *inst) {
             inst->midi_write = next;
         }
     }
+    pthread_mutex_unlock(&inst->ring_mutex);
 }
 
 /* v2: Load expansion to emulator */
@@ -1200,8 +1222,10 @@ static void v2_select_patch(jv880_instance_t *inst, int global_index) {
 
     /* Subtractive link is an editing overlay on the live patch; a freshly loaded
      * patch must arrive intact, so always drop link on patch change (decision:
-     * auto-disable, don't overwrite the new patch's per-tone data). */
+     * auto-disable, don't overwrite the new patch's per-tone data). Also drop any
+     * stale link backup so a later toggle can't clobber the new patch's tones. */
     inst->link_tones = 0;
+    inst->link_backup_valid = 0;
 
     jv_debug("[v2_select_patch] Complete\n");
 }
@@ -1474,6 +1498,11 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
 
     /* Macro semantics default (calloc already zeroes this; set explicitly for clarity) */
     inst->macro_mode = MACRO_MODE_DEFAULT;
+
+    /* Per-instance tone cache + link backup start invalid (calloc zeroes these;
+     * set explicitly for clarity / correctness against future struct moves). */
+    inst->tone_cache_valid = 0;
+    inst->link_backup_valid = 0;
 
     strncpy(inst->module_dir, module_dir, sizeof(inst->module_dir) - 1);
     fprintf(stderr, "JV880 v2: Loading from %s\n", module_dir);
@@ -1931,14 +1960,18 @@ static void v2_queue_tone_sysex(jv880_instance_t *inst, int toneIdx, int paramId
                               addr[0], addr[1], addr[2], addr[3],
                               data_hi, data_lo, chk, 0xF7 };
 
-        /* Queue the SysEx */
+        /* Queue the SysEx. Lock the ring producer so control-thread fan-outs
+         * (macros, link snap/restore) don't race the audio-thread producer
+         * (v2_on_midi / render-block PC) on midi_write. */
+        pthread_mutex_lock(&inst->ring_mutex);
         int write_idx = inst->midi_write;
         int next = (write_idx + 1) % MIDI_QUEUE_SIZE;
-        if (next == inst->midi_read) return; /* Queue full */
-
-        memcpy(inst->midi_queue[write_idx], sysex, 13);
-        inst->midi_queue_len[write_idx] = 13;
-        inst->midi_write = next;
+        if (next != inst->midi_read) { /* skip if queue full */
+            memcpy(inst->midi_queue[write_idx], sysex, 13);
+            inst->midi_queue_len[write_idx] = 13;
+            inst->midi_write = next;
+        }
+        pthread_mutex_unlock(&inst->ring_mutex);
     } else {
         /* Standard 1-byte format */
         uint8_t data = (uint8_t)(value & 0x7F);
@@ -1951,14 +1984,16 @@ static void v2_queue_tone_sysex(jv880_instance_t *inst, int toneIdx, int paramId
                               addr[0], addr[1], addr[2], addr[3],
                               data, chk, 0xF7 };
 
-        /* Queue the SysEx */
+        /* Queue the SysEx (locked; see above). */
+        pthread_mutex_lock(&inst->ring_mutex);
         int write_idx = inst->midi_write;
         int next = (write_idx + 1) % MIDI_QUEUE_SIZE;
-        if (next == inst->midi_read) return; /* Queue full */
-
-        memcpy(inst->midi_queue[write_idx], sysex, 12);
-        inst->midi_queue_len[write_idx] = 12;
-        inst->midi_write = next;
+        if (next != inst->midi_read) {
+            memcpy(inst->midi_queue[write_idx], sysex, 12);
+            inst->midi_queue_len[write_idx] = 12;
+            inst->midi_write = next;
+        }
+        pthread_mutex_unlock(&inst->ring_mutex);
     }
 }
 
@@ -1978,14 +2013,16 @@ static void v2_queue_patch_common_sysex(jv880_instance_t *inst, int paramIdx, in
                           addr[0], addr[1], addr[2], addr[3],
                           data, chk, 0xF7 };
 
-    /* Queue the SysEx */
+    /* Queue the SysEx (locked ring producer; see v2_queue_tone_sysex). */
+    pthread_mutex_lock(&inst->ring_mutex);
     int write_idx = inst->midi_write;
     int next = (write_idx + 1) % MIDI_QUEUE_SIZE;
-    if (next == inst->midi_read) return;
-
-    memcpy(inst->midi_queue[write_idx], sysex, 12);
-    inst->midi_queue_len[write_idx] = 12;
-    inst->midi_write = next;
+    if (next != inst->midi_read) {
+        memcpy(inst->midi_queue[write_idx], sysex, 12);
+        inst->midi_queue_len[write_idx] = 12;
+        inst->midi_write = next;
+    }
+    pthread_mutex_unlock(&inst->ring_mutex);
 }
 
 /* v2: Apply a macro offset across all 4 tones via SysEx
@@ -2157,14 +2194,16 @@ static void v2_queue_part_sysex(jv880_instance_t *inst, int partIdx, int paramId
                               addr[0], addr[1], addr[2], addr[3],
                               data_high, data_low, chk, 0xF7 };
 
-        /* Queue the SysEx */
+        /* Queue the SysEx (locked ring producer; see v2_queue_tone_sysex). */
+        pthread_mutex_lock(&inst->ring_mutex);
         int write_idx = inst->midi_write;
         int next = (write_idx + 1) % MIDI_QUEUE_SIZE;
-        if (next == inst->midi_read) return; /* Queue full */
-
-        memcpy(inst->midi_queue[write_idx], sysex, 13);
-        inst->midi_queue_len[write_idx] = 13;
-        inst->midi_write = next;
+        if (next != inst->midi_read) {
+            memcpy(inst->midi_queue[write_idx], sysex, 13);
+            inst->midi_queue_len[write_idx] = 13;
+            inst->midi_write = next;
+        }
+        pthread_mutex_unlock(&inst->ring_mutex);
         jv_debug("[JV880] Part%d SysEx: addr=%02X.%02X.%02X.%02X data=%02X.%02X (value=%d)\n",
                 partIdx, addr[0], addr[1], addr[2], addr[3], data_high, data_low, value);
     } else {
@@ -2179,14 +2218,16 @@ static void v2_queue_part_sysex(jv880_instance_t *inst, int partIdx, int paramId
                               addr[0], addr[1], addr[2], addr[3],
                               data, chk, 0xF7 };
 
-        /* Queue the SysEx */
+        /* Queue the SysEx (locked; see above). */
+        pthread_mutex_lock(&inst->ring_mutex);
         int write_idx = inst->midi_write;
         int next = (write_idx + 1) % MIDI_QUEUE_SIZE;
-        if (next == inst->midi_read) return;
-
-        memcpy(inst->midi_queue[write_idx], sysex, 12);
-        inst->midi_queue_len[write_idx] = 12;
-        inst->midi_write = next;
+        if (next != inst->midi_read) {
+            memcpy(inst->midi_queue[write_idx], sysex, 12);
+            inst->midi_queue_len[write_idx] = 12;
+            inst->midi_write = next;
+        }
+        pthread_mutex_unlock(&inst->ring_mutex);
         jv_debug("[JV880] Part%d SysEx: addr=%02X.%02X.%02X.%02X data=%02X (value=%d)\n",
                 partIdx, addr[0], addr[1], addr[2], addr[3], data, value);
     }
@@ -2198,10 +2239,12 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) 
     if (!inst || !inst->initialized) return;
     (void)source;
 
-    /* Copy to MIDI queue with octave transpose */
+    /* Copy to MIDI queue with octave transpose. Lock the ring producer so this
+     * audio-thread enqueue doesn't race control-thread fan-outs on midi_write. */
+    pthread_mutex_lock(&inst->ring_mutex);
     int write_idx = inst->midi_write;
     int next = (write_idx + 1) % MIDI_QUEUE_SIZE;
-    if (next == inst->midi_read) return; /* Queue full */
+    if (next == inst->midi_read) { pthread_mutex_unlock(&inst->ring_mutex); return; } /* Queue full */
 
     memcpy(inst->midi_queue[write_idx], msg, len);
     inst->midi_queue_len[write_idx] = len;
@@ -2232,6 +2275,7 @@ static void v2_on_midi(void *instance, const uint8_t *msg, int len, int source) 
     }
 
     inst->midi_write = next;
+    pthread_mutex_unlock(&inst->ring_mutex);
 }
 
 /* v2: Helper to find which bank a patch belongs to */
@@ -2535,6 +2579,15 @@ static void v2_write_one_tone_param(jv880_instance_t *inst, int toneIdx,
  * numerics that the writer accepts), so it stays correct across param types. */
 static void v2_snap_link_tones(jv880_instance_t *inst) {
     if (!inst || !inst->mcu) return;
+
+    /* Back up tones 2,3,4's current 84-byte slices BEFORE we overwrite their
+     * shared bytes, so disabling link can restore the originals. The slice
+     * fully contains every shared byte the snap below touches (matrix bytes +
+     * tone-param bytes all live within each tone's 84-byte region). */
+    const int tone2Base = NVRAM_PATCH_OFFSET + 26 + (1 * 84);
+    memcpy(inst->link_backup, &inst->mcu->nvram[tone2Base], 3 * 84);
+    inst->link_backup_valid = 1;
+
     char k[48], tmp[48];
     for (size_t i = 0; i < NUM_TONE_PARAMS; i++) {
         const char *nm = TONE_PARAMS[i].name;
@@ -2549,6 +2602,44 @@ static void v2_snap_link_tones(jv880_instance_t *inst) {
         if (v2_get_param(inst, k, tmp, sizeof(tmp)) <= 0) continue;
         for (int t = 1; t < 4; t++) v2_write_one_tone_param(inst, t, nm, tmp);
     }
+}
+
+/* Restore tones 2,3,4's pre-link shared bytes from the link backup, making the
+ * "Link all to 1" toggle reversible. Restores the NVRAM bytes, then re-emits
+ * SysEx for every shared param (read back from the restored NVRAM) so the
+ * engine state matches the working patch. No-op if no valid backup is held. */
+static void v2_restore_link_tones(jv880_instance_t *inst) {
+    if (!inst || !inst->mcu || !inst->link_backup_valid) return;
+
+    /* 1) Put the original bytes back into NVRAM. */
+    const int tone2Base = NVRAM_PATCH_OFFSET + 26 + (1 * 84);
+    memcpy(&inst->mcu->nvram[tone2Base], inst->link_backup, 3 * 84);
+    /* NVRAM changed underneath the read cache; force a refresh on next poll. */
+    inst->tone_cache_valid = 0;
+
+    /* 2) Re-emit SysEx for every shared param from the now-restored NVRAM so the
+     * running engine matches. Reuse v2_write_one_tone_param with the value read
+     * back from NVRAM (string round-trip), mirroring v2_snap_link_tones. */
+    char k[48], tmp[48];
+    for (size_t i = 0; i < NUM_TONE_PARAMS; i++) {
+        const char *nm = TONE_PARAMS[i].name;
+        if (!v2_is_shared_tone_param(nm)) continue;
+        for (int t = 1; t < 4; t++) {
+            snprintf(k, sizeof(k), "nvram_tone_%d_%s", t, nm);
+            if (v2_get_param(inst, k, tmp, sizeof(tmp)) <= 0) continue;
+            v2_write_one_tone_param(inst, t, nm, tmp);
+        }
+    }
+    for (size_t i = 0; i < NUM_MATRIX_PARAMS; i++) {
+        const char *nm = MATRIX_PARAMS[i].name;  /* all matrix params are shared */
+        for (int t = 1; t < 4; t++) {
+            snprintf(k, sizeof(k), "nvram_tone_%d_%s", t, nm);
+            if (v2_get_param(inst, k, tmp, sizeof(tmp)) <= 0) continue;
+            v2_write_one_tone_param(inst, t, nm, tmp);
+        }
+    }
+
+    inst->link_backup_valid = 0;
 }
 
 static void v2_set_param(void *instance, const char *key, const char *val) {
@@ -2783,12 +2874,15 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             }
         }
     } else if (strcmp(key, "link_tones") == 0) {
-        /* Subtractive mode toggle. On enable, snap Tone 1's shared params onto
-         * tones 2-4 so they immediately behave as one voice. */
+        /* Subtractive mode toggle. On enable, back up + snap Tone 1's shared
+         * params onto tones 2-4 so they immediately behave as one voice. On
+         * disable, restore tones 2-4's pre-link shared bytes so the toggle is
+         * fully reversible. */
         int on = (strcmp(val, "On") == 0 || atoi(val)) ? 1 : 0;
         int was = inst->link_tones;
         inst->link_tones = on;
         if (on && !was) v2_snap_link_tones(inst);
+        else if (!on && was) v2_restore_link_tones(inst);
     } else if (strcmp(key, "macro_mode") == 0) {
         /* Runtime A/B switch for macro semantics (not surfaced in UI). */
         if (strcmp(val, "relative") == 0 || strcmp(val, "MACRO_RELATIVE_RESET") == 0) {
@@ -3240,10 +3334,7 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
     }
 }
 
-/* Tone param cache - avoid hitting NVRAM on every poll */
-#define TONE_CACHE_SIZE (4 * 84)  /* 4 tones × 84 bytes each */
-static uint8_t tone_cache[TONE_CACHE_SIZE];
-static uint64_t tone_cache_valid = 0;  /* Timestamp when cache was filled */
+/* Tone param cache TTL. Cache storage is per-instance (jv880_instance_t). */
 #define TONE_CACHE_TTL_MS 50  /* Refresh cache every 50ms */
 
 static uint64_t get_time_ms(void) {
@@ -3266,16 +3357,17 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
 
             /* Refresh cache if stale */
             uint64_t now = get_time_ms();
-            if (now - tone_cache_valid > TONE_CACHE_TTL_MS) {
+            if (inst->tone_cache_valid == 0 ||
+                now - inst->tone_cache_valid > TONE_CACHE_TTL_MS) {
                 int nvramBase = NVRAM_PATCH_OFFSET + 26;
-                memcpy(tone_cache, &inst->mcu->nvram[nvramBase], TONE_CACHE_SIZE);
-                tone_cache_valid = now;
+                memcpy(inst->tone_cache, &inst->mcu->nvram[nvramBase], TONE_CACHE_SIZE);
+                inst->tone_cache_valid = now;
             }
 
             /* Per-tone control matrix (dest nibble / signed sensitivity). */
             const MatrixParam *mx = find_matrix_param(paramName);
             if (mx) {
-                uint8_t mbyte = tone_cache[(toneIdx * 84) + mx->off];
+                uint8_t mbyte = inst->tone_cache[(toneIdx * 84) + mx->off];
                 if (mx->isSens) return snprintf(buf, buf_len, "%d", (int)(int8_t)mbyte);
                 return snprintf(buf, buf_len, "%d", (mbyte >> mx->shift) & ((1 << mx->width) - 1));
             }
@@ -3283,7 +3375,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             const ToneParamEntry *p = find_tone_param(paramName);
             if (p) {
                 int cacheOffset = (toneIdx * 84) + p->nvram_offset;
-                uint8_t byte = tone_cache[cacheOffset];
+                uint8_t byte = inst->tone_cache[cacheOffset];
                 switch (p->type) {
                     case TP_BYTE:
                         if (p->signed_param == 1) {
@@ -3518,9 +3610,14 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     }
     /* State serialization for patch save/load */
     if (strcmp(key, "state") == 0) {
+        /* NOTE: link_tones is a transient editing overlay (its reversal backup
+         * is not persisted), so it is intentionally NOT serialized here — the
+         * state SET parser doesn't restore it, and emitting it would imply a
+         * round-trip that doesn't exist. Patch save captures the live (snapped)
+         * tone bytes, which is the correct persisted result. */
         int written = snprintf(buf, buf_len,
             "{\"version\":2,\"mode\":%d,\"preset\":%d,\"performance\":%d,\"part\":%d,\"octave_transpose\":%d,"
-            "\"expansion_index\":%d,\"expansion_bank_offset\":%d,\"macro_mode\":%d,\"link_tones\":%d",
+            "\"expansion_index\":%d,\"expansion_bank_offset\":%d,\"macro_mode\":%d",
             inst->performance_mode ? 1 : 0,
             inst->current_patch,
             inst->current_performance,
@@ -3528,8 +3625,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             inst->octave_transpose,
             inst->current_expansion,
             inst->expansion_bank_offset,
-            (int)inst->macro_mode,
-            inst->link_tones);
+            (int)inst->macro_mode);
 
         /* Include working patch data as hex if MCU is ready */
         if (inst->mcu && written < buf_len - 800) {
@@ -4257,7 +4353,7 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             {"wavegroup",                  "\"name\":\"Wave Group\",\"type\":\"enum\",\"min\":0,\"max\":3,\"options\":[\"INT-A\",\"INT-B\",\"EXP-A\",\"EXP-B\"]"},
             {"wavenumber",                 "\"name\":\"Wave Number\",\"type\":\"int\",\"min\":0,\"max\":255"},
             {"fxmswitch",                  "\"name\":\"FXM\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]"},
-            {"fxmdepth",                   "\"name\":\"FXM Depth\",\"type\":\"int\",\"min\":0,\"max\":15"},
+            {"fxmdepth",                   "\"name\":\"FXM Depth\",\"type\":\"int\",\"min\":1,\"max\":16"},
             /* Level/Pan */
             {"level",                      "\"name\":\"Level\",\"type\":\"int\",\"min\":0,\"max\":127"},
             {"pan",                        "\"name\":\"Pan\",\"type\":\"int\",\"min\":-64,\"max\":63,\"display\":\"pan\""},
