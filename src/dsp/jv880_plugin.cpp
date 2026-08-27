@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <time.h>
@@ -1382,6 +1383,47 @@ static void* v2_load_thread_func(void *arg) {
     fprintf(stderr, "JV880 v2: Load thread started\n");
 
     /*
+     * DROP TO SCHED_OTHER FIRST -- moving the work off the SPI callback is not
+     * enough on its own.
+     *
+     * This thread is created from create_instance, which runs ON the SPI
+     * callback, so it INHERITS SCHED_FIFO 90 -- the same priority as the
+     * callback itself. Two equal-priority SCHED_FIFO threads do not timeslice:
+     * the running one keeps the CPU until it blocks. So the 100k-iteration
+     * warmup below, which is pure CPU, ran to completion while the SPI callback
+     * waited its turn.
+     *
+     * Measured on device after the ROM read was moved here. create_instance
+     * dropped to 2-3 ms as intended, and the stall simply relocated:
+     *
+     *     06:27:46.098  pre avg=88   max=209      (before)
+     *     06:27:51.098  pre avg=289  max=203596   (the load window)
+     *     06:27:56.099  pre avg=87   max=801      (after)
+     *
+     * A single 203 ms pre_transfer against a normal max of ~200 us.
+     *
+     * The inherited policy is captured before dropping so the EMU thread, which
+     * is created from this one further down, can be given exactly what it has
+     * today. Its priority affects audio and is not what this change is about.
+     */
+    int inherited_policy = SCHED_OTHER;
+    struct sched_param inherited_param;
+    memset(&inherited_param, 0, sizeof(inherited_param));
+    pthread_getschedparam(pthread_self(), &inherited_policy, &inherited_param);
+    {
+        struct sched_param other_param;
+        memset(&other_param, 0, sizeof(other_param));
+        if (pthread_setschedparam(pthread_self(), SCHED_OTHER, &other_param) != 0) {
+            fprintf(stderr, "JV880 v2: WARNING could not drop load thread to "
+                            "SCHED_OTHER; loading may stall the UI\n");
+        } else if (inherited_policy != SCHED_OTHER) {
+            fprintf(stderr, "JV880 v2: load thread dropped from policy %d prio %d "
+                            "to SCHED_OTHER\n",
+                    inherited_policy, inherited_param.sched_priority);
+        }
+    }
+
+    /*
      * THE ROM READ, moved off create_instance -- see the note there for why.
      *
      * Everything below this block is unchanged; it simply now runs after the
@@ -1555,7 +1597,39 @@ static void* v2_load_thread_func(void *arg) {
      * while the emu_thread starts up */
     inst->thread_running = 1;
     inst->initialized = 1;
-    pthread_create(&inst->emu_thread, NULL, v2_emu_thread_func, inst);
+    /*
+     * The emu thread keeps the scheduling it had BEFORE this thread dropped
+     * itself to SCHED_OTHER.
+     *
+     * It used to inherit SCHED_FIFO 90 through this thread, and that is an
+     * audio-path decision -- arguably the wrong one, since a free-running
+     * emulator at FIFO 90 is exactly what starves Move's Link Main at FIFO 35,
+     * but changing it needs listening tests and underrun counts, not a
+     * side-effect of a UI fix. So it is restored explicitly rather than
+     * silently altered.
+     *
+     * If the explicit request is refused (no privilege from a SCHED_OTHER
+     * thread), fall back to a plain create: SCHED_OTHER is a degraded emu
+     * thread, not a broken one, and it is still better than not starting.
+     */
+    int emu_started = 0;
+    if (inherited_policy != SCHED_OTHER) {
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) == 0) {
+            pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+            pthread_attr_setschedpolicy(&attr, inherited_policy);
+            pthread_attr_setschedparam(&attr, &inherited_param);
+            emu_started = (pthread_create(&inst->emu_thread, &attr,
+                                          v2_emu_thread_func, inst) == 0);
+            if (!emu_started)
+                fprintf(stderr, "JV880 v2: WARNING emu thread refused policy %d "
+                                "prio %d; falling back to inherited scheduling\n",
+                        inherited_policy, inherited_param.sched_priority);
+            pthread_attr_destroy(&attr);
+        }
+    }
+    if (!emu_started)
+        pthread_create(&inst->emu_thread, NULL, v2_emu_thread_func, inst);
 
     inst->loading_complete = 1;
     snprintf(inst->loading_status, sizeof(inst->loading_status),
