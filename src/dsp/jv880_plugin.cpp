@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <time.h>
@@ -1381,6 +1382,140 @@ static void* v2_load_thread_func(void *arg) {
 
     fprintf(stderr, "JV880 v2: Load thread started\n");
 
+    /*
+     * DROP TO SCHED_OTHER FIRST -- moving the work off the SPI callback is not
+     * enough on its own.
+     *
+     * This thread is created from create_instance, which runs ON the SPI
+     * callback, so it INHERITS SCHED_FIFO 90 -- the same priority as the
+     * callback itself. Two equal-priority SCHED_FIFO threads do not timeslice:
+     * the running one keeps the CPU until it blocks. So the 100k-iteration
+     * warmup below, which is pure CPU, ran to completion while the SPI callback
+     * waited its turn.
+     *
+     * Measured on device after the ROM read was moved here. create_instance
+     * dropped to 2-3 ms as intended, and the stall simply relocated:
+     *
+     *     06:27:46.098  pre avg=88   max=209      (before)
+     *     06:27:51.098  pre avg=289  max=203596   (the load window)
+     *     06:27:56.099  pre avg=87   max=801      (after)
+     *
+     * A single 203 ms pre_transfer against a normal max of ~200 us.
+     *
+     * The inherited policy is captured before dropping so the EMU thread, which
+     * is created from this one further down, can be given exactly what it has
+     * today. Its priority affects audio and is not what this change is about.
+     */
+    int inherited_policy = SCHED_OTHER;
+    struct sched_param inherited_param;
+    memset(&inherited_param, 0, sizeof(inherited_param));
+    pthread_getschedparam(pthread_self(), &inherited_policy, &inherited_param);
+    {
+        struct sched_param other_param;
+        memset(&other_param, 0, sizeof(other_param));
+        if (pthread_setschedparam(pthread_self(), SCHED_OTHER, &other_param) != 0) {
+            fprintf(stderr, "JV880 v2: WARNING could not drop load thread to "
+                            "SCHED_OTHER; loading may stall the UI\n");
+        } else if (inherited_policy != SCHED_OTHER) {
+            fprintf(stderr, "JV880 v2: load thread dropped from policy %d prio %d "
+                            "to SCHED_OTHER\n",
+                    inherited_policy, inherited_param.sched_priority);
+        }
+    }
+
+    /*
+     * THE ROM READ, moved off create_instance -- see the note there for why.
+     *
+     * Everything below this block is unchanged; it simply now runs after the
+     * ROMs are up rather than after create_instance already loaded them.
+     *
+     * While this runs, `initialized` is 0 (set at the end of this function), so
+     * render_block outputs silence and on_midi drops -- both already guarded.
+     *
+     * `mcu` is deliberately NOT created here. It is allocated in
+     * create_instance, which is cheap (no constructor, just the object), so
+     * that it is never NULL on the happy path. get_param and set_param contain
+     * dozens of `inst->mcu->nvram[...]` / `->sram[...]` reads, and while most
+     * are guarded, auditing every one for a window that did not previously
+     * exist is exactly the kind of change that ships a crash. Reading an
+     * un-started emulator gives zeros; dereferencing NULL does not.
+     */
+    uint8_t *rom1 = (uint8_t *)malloc(ROM1_SIZE);
+    uint8_t *rom2 = (uint8_t *)malloc(ROM2_SIZE);
+    uint8_t *waverom1 = (uint8_t *)malloc(0x200000);
+    uint8_t *waverom2 = (uint8_t *)malloc(0x200000);
+    uint8_t *nvram = (uint8_t *)malloc(NVRAM_SIZE);
+
+    if (!rom1 || !rom2 || !waverom1 || !waverom2 || !nvram) {
+        fprintf(stderr, "JV880 v2: Memory allocation failed\n");
+        free(rom1); free(rom2); free(waverom1); free(waverom2); free(nvram);
+        delete inst->mcu;
+        inst->mcu = nullptr;
+        /*
+         * The instance cannot be freed from here -- the host owns it and will
+         * call destroy_instance -- so report it the same way a missing ROM is
+         * reported and stop. Before this move, an allocation failure returned
+         * NULL from create_instance; now it has to become a load error.
+         */
+        snprintf(inst->load_error, sizeof(inst->load_error),
+                 "Mini-JV: out of memory loading ROMs.");
+        inst->rom_loaded = 0;
+        inst->initialized = 1;   /* so get_error is reachable */
+        inst->load_thread_running = 0;
+        return NULL;
+    }
+
+    memset(nvram, 0xFF, NVRAM_SIZE);
+
+    snprintf(inst->loading_status, sizeof(inst->loading_status), "Loading ROMs...");
+
+    int ok = 1;
+    ok = ok && v2_load_rom(inst, "jv880_rom1.bin", rom1, ROM1_SIZE);
+    ok = ok && v2_load_rom(inst, "jv880_rom2.bin", rom2, ROM2_SIZE);
+    ok = ok && v2_load_rom(inst, "jv880_waverom1.bin", waverom1, 0x200000);
+    ok = ok && v2_load_rom(inst, "jv880_waverom2.bin", waverom2, 0x200000);
+
+    /* NVRAM is optional */
+    char nvram_path[1024];
+    snprintf(nvram_path, sizeof(nvram_path), "%s/roms/jv880_nvram.bin", inst->module_dir);
+    FILE *nf = fopen(nvram_path, "rb");
+    if (nf) {
+        fread(nvram, 1, NVRAM_SIZE, nf);
+        fclose(nf);
+        fprintf(stderr, "JV880 v2: Loaded NVRAM\n");
+    }
+
+    if (!ok) {
+        fprintf(stderr, "JV880 v2: ROM loading failed\n");
+        snprintf(inst->load_error, sizeof(inst->load_error),
+                 "Mini-JV: ROM files not found. Place ROM files in roms/ folder.");
+        snprintf(inst->loading_status, sizeof(inst->loading_status), "ROMs not found");
+        free(rom1); free(rom2); free(waverom1); free(waverom2); free(nvram);
+        delete inst->mcu;
+        inst->mcu = nullptr;
+        inst->rom_loaded = 0;
+        inst->initialized = 1;  /* Mark as initialized so get_error works */
+        /* NOT loading_complete: there is nothing more coming. is_loading reads
+         * the error and answers "0", so the host stops waiting and shows the
+         * error instead of a Loading screen that never resolves. */
+        inst->load_thread_running = 0;
+        return NULL;
+    }
+
+    /* Initialize emulator */
+    snprintf(inst->loading_status, sizeof(inst->loading_status), "Starting emulator...");
+    inst->mcu->startSC55(rom1, rom2, waverom1, waverom2, nvram);
+
+    /* Keep ROM2 for internal patch access */
+    inst->rom2 = rom2;
+
+    free(rom1); free(waverom1); free(waverom2); free(nvram);
+
+    inst->rom_loaded = 1;
+
+    /* Set patch mode */
+    inst->mcu->nvram[NVRAM_MODE_OFFSET] = 1;
+
     /* Scan for expansion files */
     snprintf(inst->loading_status, sizeof(inst->loading_status), "Checking expansions...");
     v2_scan_expansion_files(inst);
@@ -1462,7 +1597,39 @@ static void* v2_load_thread_func(void *arg) {
      * while the emu_thread starts up */
     inst->thread_running = 1;
     inst->initialized = 1;
-    pthread_create(&inst->emu_thread, NULL, v2_emu_thread_func, inst);
+    /*
+     * The emu thread keeps the scheduling it had BEFORE this thread dropped
+     * itself to SCHED_OTHER.
+     *
+     * It used to inherit SCHED_FIFO 90 through this thread, and that is an
+     * audio-path decision -- arguably the wrong one, since a free-running
+     * emulator at FIFO 90 is exactly what starves Move's Link Main at FIFO 35,
+     * but changing it needs listening tests and underrun counts, not a
+     * side-effect of a UI fix. So it is restored explicitly rather than
+     * silently altered.
+     *
+     * If the explicit request is refused (no privilege from a SCHED_OTHER
+     * thread), fall back to a plain create: SCHED_OTHER is a degraded emu
+     * thread, not a broken one, and it is still better than not starting.
+     */
+    int emu_started = 0;
+    if (inherited_policy != SCHED_OTHER) {
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) == 0) {
+            pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
+            pthread_attr_setschedpolicy(&attr, inherited_policy);
+            pthread_attr_setschedparam(&attr, &inherited_param);
+            emu_started = (pthread_create(&inst->emu_thread, &attr,
+                                          v2_emu_thread_func, inst) == 0);
+            if (!emu_started)
+                fprintf(stderr, "JV880 v2: WARNING emu thread refused policy %d "
+                                "prio %d; falling back to inherited scheduling\n",
+                        inherited_policy, inherited_param.sched_priority);
+            pthread_attr_destroy(&attr);
+        }
+    }
+    if (!emu_started)
+        pthread_create(&inst->emu_thread, NULL, v2_emu_thread_func, inst);
 
     inst->loading_complete = 1;
     snprintf(inst->loading_status, sizeof(inst->loading_status),
@@ -1524,73 +1691,60 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
     inst->found_perf_sram_offset = -1;
     inst->map_last_offset = -1;
 
-    /* Create emulator instance */
+    /*
+     * The emulator OBJECT is created here, but not started.
+     *
+     * MCU has no constructor -- this is an allocation, not the ROM load -- and
+     * keeping it here means `inst->mcu` is never NULL while the ROMs come up.
+     * get_param and set_param are full of `inst->mcu->nvram[...]` reads and the
+     * load thread opens a window that did not exist before; an un-started
+     * emulator reads as zeros, a NULL one is a crash on the SPI callback.
+     */
     inst->mcu = new MCU();
 
-    /* Load ROMs */
-    uint8_t *rom1 = (uint8_t *)malloc(ROM1_SIZE);
-    uint8_t *rom2 = (uint8_t *)malloc(ROM2_SIZE);
-    uint8_t *waverom1 = (uint8_t *)malloc(0x200000);
-    uint8_t *waverom2 = (uint8_t *)malloc(0x200000);
-    uint8_t *nvram = (uint8_t *)malloc(NVRAM_SIZE);
-
-    if (!rom1 || !rom2 || !waverom1 || !waverom2 || !nvram) {
-        fprintf(stderr, "JV880 v2: Memory allocation failed\n");
-        free(rom1); free(rom2); free(waverom1); free(waverom2); free(nvram);
-        delete inst->mcu;
-        pthread_mutex_destroy(&inst->ring_mutex);
-        free(inst);
-        return NULL;
-    }
-
-    memset(nvram, 0xFF, NVRAM_SIZE);
-
-    int ok = 1;
-    ok = ok && v2_load_rom(inst, "jv880_rom1.bin", rom1, ROM1_SIZE);
-    ok = ok && v2_load_rom(inst, "jv880_rom2.bin", rom2, ROM2_SIZE);
-    ok = ok && v2_load_rom(inst, "jv880_waverom1.bin", waverom1, 0x200000);
-    ok = ok && v2_load_rom(inst, "jv880_waverom2.bin", waverom2, 0x200000);
-
-    /* NVRAM is optional */
-    char nvram_path[1024];
-    snprintf(nvram_path, sizeof(nvram_path), "%s/roms/jv880_nvram.bin", module_dir);
-    FILE *nf = fopen(nvram_path, "rb");
-    if (nf) {
-        fread(nvram, 1, NVRAM_SIZE, nf);
-        fclose(nf);
-        fprintf(stderr, "JV880 v2: Loaded NVRAM\n");
-    }
-
-    if (!ok) {
-        fprintf(stderr, "JV880 v2: ROM loading failed\n");
-        snprintf(inst->load_error, sizeof(inst->load_error),
-                 "Mini-JV: ROM files not found. Place ROM files in roms/ folder.");
-        free(rom1); free(rom2); free(waverom1); free(waverom2); free(nvram);
-        delete inst->mcu;
-        inst->mcu = nullptr;
-        inst->rom_loaded = 0;
-        inst->initialized = 1;  /* Mark as initialized so get_error works */
-        return inst;  /* Return instance so error can be retrieved */
-    }
-
-    /* Initialize emulator */
-    inst->mcu->startSC55(rom1, rom2, waverom1, waverom2, nvram);
-
-    /* Keep ROM2 for internal patch access */
-    inst->rom2 = rom2;
-
-    free(rom1); free(waverom1); free(waverom2); free(nvram);
-
-    inst->rom_loaded = 1;
-
-    /* Set patch mode */
-    inst->mcu->nvram[NVRAM_MODE_OFFSET] = 1;
-
-    /* Load patches/expansions and warmup in background */
+    /*
+     * EVERYTHING ELSE HAPPENS ON THE LOAD THREAD.
+     *
+     * create_instance runs on the SPI callback -- the same thread that serves
+     * every param request the host UI makes. There is no control thread; this
+     * is the most misunderstood thing about the plugin API.
+     *
+     * Reading the ROMs here cost ~500 ms of eMMC I/O for ~4.5 MB (two 2 MB
+     * waveroms plus ROM1/ROM2/NVRAM) and it cost it on EVERY load, warm or
+     * cold, because it is file I/O and not something dlopen can cache.
+     * Measured on device from the host's own [chain-v2] load timestamps:
+     *
+     *     plaits   2 ms cold /   2 ms warm
+     *     osirus 124 ms cold /   2 ms warm   (its 124 ms was dlopen paging in)
+     *     minijv 519 ms cold / 502 ms warm   <-- all of it right here
+     *
+     * For that half-second the whole Schwung UI was blocked: chain positions
+     * read back empty, the module editor could not fetch its contract, and
+     * picking the module visibly stalled before the editor came back.
+     *
+     * The load thread already existed for the expansion scan and the warmup,
+     * and the deferred-state and `initialized` machinery it needs was already
+     * here -- so this moves the ROM read to the front of that thread rather
+     * than adding a second one. NOTE that this means the thread's scheduling
+     * is unchanged: it still inherits SCHED_FIFO 90 from this callback, which
+     * is a real pre-existing problem (Move's own Link Main runs at FIFO 35)
+     * but not one to change in the same breath as this, because the emu thread
+     * is created from it and its priority affects audio.
+     */
     inst->load_thread_running = 1;
-    pthread_create(&inst->load_thread, NULL, v2_load_thread_func, inst);
+    if (pthread_create(&inst->load_thread, NULL, v2_load_thread_func, inst) != 0) {
+        /* Nothing will ever load. Say so rather than sitting at is_loading=1
+         * forever -- that is the same contract the ROMs-missing path keeps. */
+        fprintf(stderr, "JV880 v2: Failed to start load thread\n");
+        inst->load_thread_running = 0;
+        snprintf(inst->load_error, sizeof(inst->load_error),
+                 "Mini-JV: could not start loader thread.");
+        snprintf(inst->loading_status, sizeof(inst->loading_status), "Load failed");
+        inst->initialized = 1;   /* so get_error is reachable */
+        return inst;
+    }
 
-    fprintf(stderr, "JV880 v2: Instance created\n");
+    fprintf(stderr, "JV880 v2: Instance created (ROMs loading in background)\n");
     return inst;
 }
 
@@ -3676,6 +3830,30 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     }
     if (strcmp(key, "loading_status") == 0) {
         return snprintf(buf, buf_len, "%s", inst->loading_status);
+    }
+    /*
+     * THE KEY THE HOST ACTUALLY WAITS ON.
+     *
+     * Schwung's shadow UI holds a "Loading..." screen while a component reports
+     * is_loading == "1" (openComponentEditor in src/shadow/shadow_ui.js, and
+     * the knob grid's contract settle) instead of dropping into an empty
+     * editor. This module never served the key, so the host read the unserved
+     * "" as "does not implement it" and the wait it already knows how to do
+     * never ran. That mattered much more once the ROM read moved off
+     * create_instance, because the not-ready window is now visible to the UI
+     * instead of being hidden behind a blocked param channel.
+     *
+     * Must be exactly "1" or "0" -- on anything else the host latches
+     * isLoadingSupported = false and never asks again for this component.
+     *
+     * A FAILED load is not a loading one. `loading_complete` never gets set on
+     * the ROMs-missing path, so keying on it alone would hold the host on a
+     * Loading screen forever for the one case where it should be showing the
+     * error. Hence the load_error test.
+     */
+    if (strcmp(key, "is_loading") == 0) {
+        int busy = (!inst->loading_complete && !inst->load_error[0]) ? 1 : 0;
+        return snprintf(buf, buf_len, "%d", busy);
     }
     if (strcmp(key, "audio_diag") == 0) {
         int avail = v2_ring_available(inst);
