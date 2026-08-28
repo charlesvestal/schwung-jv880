@@ -103,6 +103,8 @@ static void jv_debug(const char *fmt, ...) {
  */
 #define TEMP_PERF_COMMON_SIZE   28   /* Bytes before part data starts */
 #define TEMP_PERF_PART_SIZE     22   /* Bytes per part (discovered) */
+#define NUM_INTERNAL_PERFS      16   /* Writable performance slots in NVRAM */
+#define PERF_NAME_LEN           12   /* Leading ASCII name bytes */
 
 /* Expansion ROM support */
 #define EXPANSION_SIZE_8MB 0x800000  /* 8MB standard */
@@ -435,6 +437,66 @@ static const PatchCommonParam PATCH_COMMON_PARAMS[] = {
 static const PatchCommonParam* find_patch_common_param(const char *name) {
     for (size_t i = 0; i < NUM_PATCH_COMMON_PARAMS; i++)
         if (strcmp(PATCH_COMMON_PARAMS[i].name, name) == 0) return &PATCH_COMMON_PARAMS[i];
+    return NULL;
+}
+
+/* ---- Performance Common parameters ------------------------------------
+ * The same shape as PATCH_COMMON_PARAMS one level up: offset within the
+ * 204-byte temp performance at SRAM 0x206a, a bitfield, and the Roland
+ * Performance-Common SysEx index (DT1 to 00 00 10 <sysexIdx>).
+ *
+ * These are NOT the patch's reverb and chorus. On the JV-880 the effects in
+ * Performance mode belong to the PERFORMANCE, not to each part's patch, so
+ * the Effects page reachable in patch mode is the wrong control here and the
+ * two sets have to coexist.
+ *
+ * Offsets are the ones the automated SRAM mapping found (see
+ * docs/TODO-performance-editing.md, "Temp Performance SRAM Layout"): byte 12
+ * packs keymode/reverbtype/chorustype and byte 16 packs choruslevel with
+ * chorusoutput in its top bit, so set is read-modify-write while each
+ * sub-param keeps its own SysEx address.
+ *
+ * voicereserve1-8 (offsets 20-27) are deliberately absent: eight knobs that
+ * must sum to 28 is not a control a 128x64 grid can express honestly, and
+ * getting it wrong steals polyphony silently.
+ */
+typedef struct {
+    const char *name;
+    int sysexIdx;     /* 4th DT1 address byte under 00 00 10 */
+    int sramOffset;   /* byte offset within the 204-byte performance */
+    int shift;
+    int width;
+    int minv, maxv;
+} PerfCommonParam;
+
+static const PerfCommonParam PERF_COMMON_PARAMS[] = {
+    /* name,            sysex, off, sh, w, min, max */
+    /* Byte 12 is `reverbtype(0-2) | keymode(3-4) | unused(5) | chorustype(6-7)`.
+     * The layout recorded in docs/TODO-performance-editing.md put keymode in
+     * the low bits, reverbtype at 2, and chorustype across 5-7; decoding all
+     * 48 factory performances out of ROM2/NVRAM rejects that outright —
+     * keymode reached 3 in 16 of them (three modes exist) and chorustype only
+     * ever took 0/2/4, i.e. bit 5 was never part of it. Under the layout
+     * below every one of the 48 lands in range, bit 5 is set in none of them,
+     * and reverbtype uses 7 of its 8 values. It also matches the PATCH common
+     * table above, which puts reverbtype at shift 0. */
+    {"keymode",         0x0C,  12,  3,  2,  0,   2},
+    {"reverbtype",      0x0D,  12,  0,  3,  0,   7},
+    {"chorustype",      0x11,  12,  6,  2,  0,   2},
+    {"reverblevel",     0x0E,  13,  0,  7,  0, 127},
+    {"reverbtime",      0x0F,  14,  0,  7,  0, 127},
+    {"reverbfeedback",  0x10,  15,  0,  7,  0, 127},
+    {"choruslevel",     0x12,  16,  0,  7,  0, 127},
+    {"chorusoutput",    0x16,  16,  7,  1,  0,   1},
+    {"chorusdepth",     0x13,  17,  0,  7,  0, 127},
+    {"chorusrate",      0x14,  18,  0,  7,  0, 127},
+    {"chorusfeedback",  0x15,  19,  0,  7,  0, 127},
+};
+#define NUM_PERF_COMMON_PARAMS (sizeof(PERF_COMMON_PARAMS)/sizeof(PERF_COMMON_PARAMS[0]))
+
+static const PerfCommonParam* find_perf_common_param(const char *name) {
+    for (size_t i = 0; i < NUM_PERF_COMMON_PARAMS; i++)
+        if (strcmp(PERF_COMMON_PARAMS[i].name, name) == 0) return &PERF_COMMON_PARAMS[i];
     return NULL;
 }
 
@@ -2151,12 +2213,19 @@ static void v2_queue_tone_sysex(jv880_instance_t *inst, int toneIdx, int paramId
     }
 }
 
-/* v2: Helper to queue SysEx for patch common parameter changes */
-static void v2_queue_patch_common_sysex(jv880_instance_t *inst, int paramIdx, int value) {
+/* v2: Queue a single-byte Roland DT1 write to an arbitrary address.
+ *
+ * Patch Common (00 08 20 <idx>) and Performance Common (00 00 10 <idx>)
+ * differ ONLY in the first three address bytes, so they share this rather
+ * than each carrying its own copy of the checksum and the ring producer —
+ * the part that is easy to get subtly wrong twice.
+ */
+static void v2_queue_dt1_byte(jv880_instance_t *inst,
+                              uint8_t a0, uint8_t a1, uint8_t a2, int paramIdx, int value) {
     if (!inst) return;
 
     /* Build Roland DT1 SysEx: F0 41 10 46 12 addr[4] data checksum F7 */
-    uint8_t addr[4] = { 0x00, 0x08, 0x20, (uint8_t)paramIdx };
+    uint8_t addr[4] = { a0, a1, a2, (uint8_t)paramIdx };
     uint8_t data = (uint8_t)(value & 0x7F);
 
     /* Calculate checksum */
@@ -2177,6 +2246,16 @@ static void v2_queue_patch_common_sysex(jv880_instance_t *inst, int paramIdx, in
         inst->midi_write = next;
     }
     pthread_mutex_unlock(&inst->ring_mutex);
+}
+
+/* v2: Helper to queue SysEx for patch common parameter changes */
+static void v2_queue_patch_common_sysex(jv880_instance_t *inst, int paramIdx, int value) {
+    v2_queue_dt1_byte(inst, 0x00, 0x08, 0x20, paramIdx, value);
+}
+
+/* v2: Helper to queue SysEx for performance common parameter changes */
+static void v2_queue_perf_common_sysex(jv880_instance_t *inst, int paramIdx, int value) {
+    v2_queue_dt1_byte(inst, 0x00, 0x00, 0x10, paramIdx, value);
 }
 
 /* v2: Apply a macro offset across all 4 tones via SysEx
@@ -3013,6 +3092,19 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             *b = (uint8_t)((*b & ~mask) | ((v << pc->shift) & mask));
             v2_queue_patch_common_sysex(inst, pc->sysexIdx, v);
         }
+    } else if (strncmp(key, "sram_perfCommon_", 16) == 0 && inst->mcu) {
+        /* Performance common lives in SRAM, not NVRAM: it is the TEMP
+         * performance, the same buffer do_save_to_perf_slot copies out. Same
+         * read-modify-write as patch common, because byte 12 and byte 16 each
+         * pack three and two params respectively. */
+        const PerfCommonParam *pc = find_perf_common_param(key + 16);
+        if (pc) {
+            int v = clamp_int(atoi(val), pc->minv, pc->maxv);
+            int mask = ((1 << pc->width) - 1) << pc->shift;
+            uint8_t *b = &inst->mcu->sram[SRAM_TEMP_PERF_OFFSET + pc->sramOffset];
+            *b = (uint8_t)((*b & ~mask) | ((v << pc->shift) & mask));
+            v2_queue_perf_common_sysex(inst, pc->sysexIdx, v);
+        }
     } else if (strncmp(key, "nvram_tone_", 11) == 0 && inst->mcu) {
         int toneIdx = atoi(key + 11);
         const char *underscore = strchr(key + 11, '_');
@@ -3175,6 +3267,21 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
                 v2_queue_part_sysex(inst, partIdx, 30, v, 0);
                 return;
             }
+            /* Whether the part plays the internal sound at all — the "is this
+             * part on" switch, and the one part control that was missing.
+             * Byte 0 bit 7 (see the packed-byte layouts in
+             * docs/TODO-performance-editing.md); SysEx 0x0E. */
+            if (strcmp(paramName, "internalswitch") == 0) {
+                int v;
+                if (strcmp(val, "On") == 0) v = 1;
+                else if (strcmp(val, "Off") == 0) v = 0;
+                else v = atoi(val) ? 1 : 0;
+                uint8_t *b = &inst->mcu->sram[partBase + 0];
+                if (v) *b |= 0x80;
+                else *b &= ~0x80;
+                v2_queue_part_sysex(inst, partIdx, 0x0E, v, 0);
+                return;
+            }
 
             /* Handle signed parameters (coarse/fine tune, transpose) */
             if (strcmp(paramName, "partcoarsetune") == 0) { sramOffset = 19; sysexIdx = 27; }
@@ -3183,8 +3290,13 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
 
             if (sramOffset >= 0 && sysexIdx >= 0) {
                 int v = clamp_int(atoi(val), 0, 127);
-                /* Check if this is a signed parameter (tune/transpose) */
-                if (sramOffset == 19 || sramOffset == 20 || sramOffset == 12) {
+                /* Check if this is a signed parameter (tune/transpose/vel sense).
+                 * Offset 13 (internalvelocitysense) belongs here and was
+                 * missing: it is centred at 64 like the tunes, so storing it
+                 * raw put every value 64 steps out. Nothing read it back and
+                 * no UI reached it, so the error was invisible — the get_param
+                 * case below is what makes it observable. */
+                if (sramOffset == 19 || sramOffset == 20 || sramOffset == 12 || sramOffset == 13) {
                     int stored = v - 64;
                     if (stored < -64) stored = -64;
                     if (stored > 63) stored = 63;
@@ -3311,6 +3423,33 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             memcpy(name, &inst->mcu->nvram[NVRAM_PATCH_OFFSET], PATCH_NAME_LEN);
             name[PATCH_NAME_LEN] = '\0';
             fprintf(stderr, "JV880 v2: Saved patch '%s' to User slot %d\n", name, slot + 1);
+            /* Auto-save NVRAM to persist */
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/roms/jv880_nvram.bin", inst->module_dir);
+            FILE* f = fopen(path, "wb");
+            if (f) {
+                fwrite(inst->mcu->nvram, 1, NVRAM_SIZE, f);
+                fclose(f);
+                chown_to_ableton(path);
+            }
+        }
+    } else if (strcmp(key, "do_save_to_perf_slot") == 0 && inst->mcu) {
+        /* Save the temp performance to one of the 16 Internal slots, then
+         * persist NVRAM — the performance half of do_save_to_slot.
+         *
+         * write_performance_<slot> has done the copy since performance saving
+         * landed, and nothing in the chain UI could reach it: there was no
+         * level, no items list and no trigger. This is that reachable path. */
+        int slot = atoi(val);
+        if (slot >= 0 && slot < NUM_INTERNAL_PERFS) {
+            uint32_t dest_offset = NVRAM_PERF_INTERNAL + (slot * PERF_SIZE);
+            memcpy(&inst->mcu->nvram[dest_offset],
+                   &inst->mcu->sram[SRAM_TEMP_PERF_OFFSET], PERF_SIZE);
+            char name[PERF_NAME_LEN + 1];
+            memcpy(name, &inst->mcu->sram[SRAM_TEMP_PERF_OFFSET], PERF_NAME_LEN);
+            name[PERF_NAME_LEN] = '\0';
+            fprintf(stderr, "JV880 v2: Saved performance '%s' to Internal slot %d\n",
+                    name, slot + 1);
             /* Auto-save NVRAM to persist */
             char path[1024];
             snprintf(path, sizeof(path), "%s/roms/jv880_nvram.bin", inst->module_dir);
@@ -3663,8 +3802,18 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             else if (strcmp(paramName, "partpan") == 0) offset = 18;
             else if (strcmp(paramName, "internalkeyrangelower") == 0) offset = 10;
             else if (strcmp(paramName, "internalkeyrangeupper") == 0) offset = 11;
+            /* internalvelocitymax was WRITEABLE and unreadable — set_param has
+             * had a case for it all along and this fast path did not, so a
+             * hierarchy entry for it would have written fine and shown
+             * nothing. Its sibling internalvelocitysense is signed and is
+             * handled with the tunes below. */
+            else if (strcmp(paramName, "internalvelocitymax") == 0) offset = 14;
 
             /* Handle reverbswitch and chorusswitch as bit fields */
+            if (strcmp(paramName, "internalswitch") == 0) {
+                uint8_t b = inst->mcu->sram[partBase + 0];
+                return snprintf(buf, buf_len, "%s", ((b >> 7) & 1) ? "On" : "Off");
+            }
             if (strcmp(paramName, "reverbswitch") == 0) {
                 uint8_t b = inst->mcu->sram[partBase + 21];
                 return snprintf(buf, buf_len, "%s", ((b >> 6) & 1) ? "On" : "Off");
@@ -3677,9 +3826,11 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             /* Signed offset parameters */
             if (strcmp(paramName, "partcoarsetune") == 0 ||
                 strcmp(paramName, "partfinetune") == 0 ||
+                strcmp(paramName, "internalvelocitysense") == 0 ||
                 strcmp(paramName, "internalkeytranspose") == 0) {
                 if (strcmp(paramName, "partcoarsetune") == 0) offset = 19;
                 else if (strcmp(paramName, "partfinetune") == 0) offset = 20;
+                else if (strcmp(paramName, "internalvelocitysense") == 0) offset = 13;
                 else if (strcmp(paramName, "internalkeytranspose") == 0) offset = 12;
                 if (offset >= 0) {
                     int8_t stored = (int8_t)inst->mcu->sram[partBase + offset];
@@ -3699,6 +3850,16 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         const PatchCommonParam *pc = find_patch_common_param(key + 18);
         if (pc) {
             uint8_t b = inst->mcu->nvram[NVRAM_PATCH_OFFSET + pc->nvramOffset];
+            int v = (b >> pc->shift) & ((1 << pc->width) - 1);
+            return snprintf(buf, buf_len, "%d", v);
+        }
+    }
+
+    /* Fast path for sram_perfCommon_ params (performance FX + key mode) */
+    if (strncmp(key, "sram_perfCommon_", 16) == 0 && inst->mcu) {
+        const PerfCommonParam *pc = find_perf_common_param(key + 16);
+        if (pc) {
+            uint8_t b = inst->mcu->sram[SRAM_TEMP_PERF_OFFSET + pc->sramOffset];
             int v = (b >> pc->shift) & ((1 << pc->width) - 1);
             return snprintf(buf, buf_len, "%d", v);
         }
@@ -4006,6 +4167,35 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     memcpy(name_buf, &inst->mcu->nvram[offset], 12);
                     name_buf[12] = '\0';
                     for (int j = 11; j >= 0 && name_buf[j] == ' '; j--) {
+                        name_buf[j] = '\0';
+                    }
+                    slot_name = name_buf;
+                }
+            }
+
+            written += snprintf(buf + written, buf_len - written,
+                "{\"index\":%d,\"name\":\"%02d: %s\"}", i, i + 1, slot_name);
+        }
+        written += snprintf(buf + written, buf_len - written, "]");
+        return written;
+    }
+    /* Save performance slot list - the 16 Internal performance slots, named.
+     * Same shape as save_patch_slot_list; a slot whose first byte is 0xFF has
+     * never been written. */
+    if (strcmp(key, "save_perf_slot_list") == 0) {
+        int written = snprintf(buf, buf_len, "[");
+        for (int i = 0; i < NUM_INTERNAL_PERFS; i++) {
+            if (i > 0) written += snprintf(buf + written, buf_len - written, ",");
+
+            const char *slot_name = "(empty)";
+            char name_buf[PERF_NAME_LEN + 1];
+
+            if (inst->mcu) {
+                uint32_t offset = NVRAM_PERF_INTERNAL + (i * PERF_SIZE);
+                if (inst->mcu->nvram[offset] != 0xFF) {
+                    memcpy(name_buf, &inst->mcu->nvram[offset], PERF_NAME_LEN);
+                    name_buf[PERF_NAME_LEN] = '\0';
+                    for (int j = PERF_NAME_LEN - 1; j >= 0 && name_buf[j] == ' '; j--) {
                         name_buf[j] = '\0';
                     }
                     slot_name = name_buf;
@@ -4472,10 +4662,52 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     "\"children\":null,"
                     "\"knobs\":[\"octave_transpose\"],"
                     "\"params\":["
+                        "{\"level\":\"perf_common\",\"label\":\"Common / Effects\"},"
                         "{\"level\":\"part_selector\",\"label\":\"Edit Parts\"},"
+                        "{\"level\":\"save_perf_slot\",\"label\":\"Save to Slot\"},"
                         "{\"level\":\"load_expansion\",\"label\":\"Load Expansion\"},"
                         "{\"key\":\"octave_transpose\",\"label\":\"Octave\"}"
                     "]"
+                "},"
+                /* The performance's OWN reverb and chorus. Not the same
+                 * controls as the patch-mode Effects page: in Performance mode
+                 * the JV-880 takes its effects from the performance, so the
+                 * patch's are not what is sounding. Key mode leads, since it
+                 * is what decides how the 8 parts respond at all. */
+                "\"perf_common\":{"
+                    "\"label\":\"Common / Effects\","
+                    "\"children\":null,"
+                    /* Key Mode takes a knob even though the patch-mode Effects
+                     * page has no equivalent: knobs[] is the first page, and
+                     * how the 8 parts respond to the keyboard outranks a
+                     * reverb feedback amount. Feedback moves to page 2. */
+                    "\"knobs\":[\"sram_perfCommon_keymode\",\"sram_perfCommon_reverbtype\",\"sram_perfCommon_reverblevel\",\"sram_perfCommon_reverbtime\",\"sram_perfCommon_chorustype\",\"sram_perfCommon_choruslevel\",\"sram_perfCommon_chorusdepth\",\"sram_perfCommon_chorusrate\"],"
+                    "\"knob_labels\":[\"Key\",\"RvTy\",\"RvLv\",\"RvTm\",\"ChTy\",\"ChLv\",\"ChDp\",\"ChRt\"],"
+                    "\"params\":["
+                        "{\"key\":\"sram_perfCommon_keymode\",\"label\":\"Key Mode\"},"
+                        "{\"key\":\"sram_perfCommon_reverbtype\",\"label\":\"Reverb Type\"},"
+                        "{\"key\":\"sram_perfCommon_reverblevel\",\"label\":\"Reverb Level\"},"
+                        "{\"key\":\"sram_perfCommon_reverbtime\",\"label\":\"Reverb Time\"},"
+                        "{\"key\":\"sram_perfCommon_reverbfeedback\",\"label\":\"Reverb Feedback\"},"
+                        "{\"key\":\"sram_perfCommon_chorustype\",\"label\":\"Chorus Type\"},"
+                        "{\"key\":\"sram_perfCommon_choruslevel\",\"label\":\"Chorus Level\"},"
+                        "{\"key\":\"sram_perfCommon_chorusdepth\",\"label\":\"Chorus Depth\"},"
+                        "{\"key\":\"sram_perfCommon_chorusrate\",\"label\":\"Chorus Rate\"},"
+                        "{\"key\":\"sram_perfCommon_chorusfeedback\",\"label\":\"Chorus Feedback\"},"
+                        "{\"key\":\"sram_perfCommon_chorusoutput\",\"label\":\"Chorus Output\"}"
+                    "]"
+                "},"
+                /* Performance saving, reachable at last: the copy has existed
+                 * as write_performance_<slot> since it was implemented, with
+                 * no level, no list and no trigger in front of it. */
+                "\"save_perf_slot\":{"
+                    "\"label\":\"Save to Slot\","
+                    "\"items_param\":\"save_perf_slot_list\","
+                    "\"select_param\":\"do_save_to_perf_slot\","
+                    "\"navigate_to\":\"performance\","
+                    "\"children\":null,"
+                    "\"knobs\":[],"
+                    "\"params\":[]"
                 "},"
                 "\"load_expansion\":{"
                     "\"label\":\"Load Expansion\","
@@ -4493,7 +4725,11 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
                     "\"child_label\":\"Part\","
                     "\"knobs\":[\"partlevel\",\"partpan\",\"reverbswitch\",\"chorusswitch\",\"partcoarsetune\",\"partfinetune\",\"internalkeyrangelower\",\"internalkeyrangeupper\"],"
                     "\"knob_labels\":[\"Lvl\",\"Pan\",\"Rev\",\"Cho\",\"CTn\",\"FTn\",\"KLo\",\"KHi\"],"
-                    "\"params\":[\"patchbank\",\"patchnumber\",\"partlevel\",\"partpan\",\"reverbswitch\",\"chorusswitch\",\"partcoarsetune\",\"partfinetune\",\"internalkeyrangelower\",\"internalkeyrangeupper\",\"internalkeytranspose\"]"
+                    /* internalswitch leads: it is whether the part sounds at
+                     * all, and it was the one part control with no entry. The
+                     * two velocity params follow it — both were already
+                     * writeable and neither was readable. */
+                    "\"params\":[\"internalswitch\",\"patchbank\",\"patchnumber\",\"partlevel\",\"partpan\",\"reverbswitch\",\"chorusswitch\",\"partcoarsetune\",\"partfinetune\",\"internalkeyrangelower\",\"internalkeyrangeupper\",\"internalkeytranspose\",\"internalvelocitysense\",\"internalvelocitymax\"]"
                 "},"
                 "\"expansions\":{"
                     "\"label\":\"Jump to Expansion\","
@@ -4637,7 +4873,12 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         /* ---- static head: navigation + macros + patch common ---- */
         APPEND("%s",
             "["
-            /* Basic navigation */
+            /* Basic navigation.
+             *
+             * `mode` was declared in module.json and NOT here, and the shadow
+             * UI reads this one — so the Mode page had no metadata and drew
+             * its rows as the raw level names, lowercase. */
+            "{\"key\":\"mode\",\"name\":\"Mode\",\"type\":\"enum\",\"options\":[\"Patch\",\"Performance\"]},"
             "{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":9999},"
             "{\"key\":\"performance\",\"name\":\"Performance\",\"type\":\"int\",\"min\":0,\"max\":47},"
             "{\"key\":\"part\",\"name\":\"Part\",\"type\":\"int\",\"min\":0,\"max\":7},"
@@ -4690,8 +4931,28 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
         /* ---- static tail: part params (bare keys; sram_part_<n>_ added by the
          * part_selector child_prefix at set/get time) ---- */
         APPEND("%s",
-            /* Part params (suffix only - child_prefix adds sram_part_N_) */
-            "{\"key\":\"patchbank\",\"name\":\"Bank\",\"type\":\"enum\",\"options\":[\"Internal\",\"Preset A\",\"Preset B\"]},"
+            /* ---- Performance common (fully-qualified sram_perfCommon_ keys) ---- */
+            "{\"key\":\"sram_perfCommon_keymode\",\"name\":\"Key Mode\",\"type\":\"enum\",\"options\":[\"Layer\",\"Zone\",\"Single\"]},"
+            "{\"key\":\"sram_perfCommon_reverbtype\",\"name\":\"Reverb Type\",\"type\":\"enum\",\"options\":[\"Room1\",\"Room2\",\"Stage1\",\"Stage2\",\"Hall1\",\"Hall2\",\"Delay\",\"Pan-Dly\"]},"
+            "{\"key\":\"sram_perfCommon_reverblevel\",\"name\":\"Reverb Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"sram_perfCommon_reverbtime\",\"name\":\"Reverb Time\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"sram_perfCommon_reverbfeedback\",\"name\":\"Reverb Feedback\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"sram_perfCommon_chorustype\",\"name\":\"Chorus Type\",\"type\":\"enum\",\"options\":[\"Chorus1\",\"Chorus2\",\"Chorus3\"]},"
+            "{\"key\":\"sram_perfCommon_choruslevel\",\"name\":\"Chorus Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"sram_perfCommon_chorusdepth\",\"name\":\"Chorus Depth\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"sram_perfCommon_chorusrate\",\"name\":\"Chorus Rate\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"sram_perfCommon_chorusfeedback\",\"name\":\"Chorus Feedback\",\"type\":\"int\",\"min\":0,\"max\":127},"
+            "{\"key\":\"sram_perfCommon_chorusoutput\",\"name\":\"Chorus Output\",\"type\":\"enum\",\"options\":[\"Mix\",\"Reverb\"]},"
+            /* Part params (suffix only - child_prefix adds sram_part_N_).
+             *
+             * `patchbank` listed THREE options against a set/get that speaks
+             * four ("User" first). An enum cell is addressed by option index,
+             * so choosing "Internal" selected User and every bank was one out,
+             * while get_param answered a name the list did not contain. */
+            "{\"key\":\"patchbank\",\"name\":\"Bank\",\"type\":\"enum\",\"options\":[\"User\",\"Internal\",\"Preset A\",\"Preset B\"]},"
+            "{\"key\":\"internalswitch\",\"name\":\"Part On\",\"type\":\"enum\",\"options\":[\"Off\",\"On\"]},"
+            "{\"key\":\"internalvelocitysense\",\"name\":\"Vel Sense\",\"type\":\"int\",\"min\":1,\"max\":127},"
+            "{\"key\":\"internalvelocitymax\",\"name\":\"Vel Max\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"partlevel\",\"name\":\"Part Level\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"partpan\",\"name\":\"Part Pan\",\"type\":\"int\",\"min\":0,\"max\":127},"
             "{\"key\":\"patchnumber\",\"name\":\"Patch\",\"type\":\"int\",\"min\":0,\"max\":63},"
