@@ -171,6 +171,40 @@
             "Knob 7: Vel Sense",
             "Knob 8: Vel Max"
           ]
+        },
+        {
+          "title": "In a Chain Slot",
+          "lines": [
+            "Picking Performance",
+            "on the Mode page",
+            "swaps the pages for",
+            "the performance set:",
+            "",
+            "Presets: the 48",
+            " performances",
+            "Common / Effects:",
+            " key mode + the",
+            " PERFORMANCE reverb",
+            " and chorus (not",
+            " the patch's)",
+            "Edit Parts: pick a",
+            " part, then level,",
+            " pan, tune, key",
+            " range, velocity,",
+            " its patch, and",
+            " Part On",
+            "Save to Slot: write",
+            " to one of the 16",
+            " Internal slots",
+            "Load Expansion",
+            "",
+            "Patch pages (tones,",
+            "macros) are hidden",
+            "here - they edit a",
+            "patch, and a",
+            "performance plays",
+            "eight of them."
+          ]
         }
       ]
     },

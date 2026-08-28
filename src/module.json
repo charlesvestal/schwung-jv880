@@ -2,7 +2,7 @@
     "id": "minijv",
     "name": "Mini-JV",
     "abbrev": "JV",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "description": "ROM-based PCM rompler emulator",
     "author": "nukeykt/giulioz (port: charlesvestal)",
     "license": "Non-commercial",
@@ -146,7 +146,33 @@
                 "tone1_lfo2":   { "name": "LFO 2",    "_note": "explicit nvram_tone_0_* keys; see C source" },
                 "tone1_fx":     { "name": "FX Sends", "_note": "explicit nvram_tone_0_* keys; see C source" },
                 "tone2_etc":    { "name": "(tone2..tone4 mirror tone1 with the index changed; see C source)" },
-                "save_slot":   { "name": "Save to Slot", "items_param": "save_patch_slot_list", "select_param": "do_save_to_slot", "navigate_to": "patch", "knobs": [] }
+                "save_slot":   { "name": "Save to Slot", "items_param": "save_patch_slot_list", "select_param": "do_save_to_slot", "navigate_to": "patch", "knobs": [] },
+                "_performance_note": "The live hierarchy declares modes ['patch','performance'] and the two trees are DISJOINT — the host roots its page walk at the active mode, so nothing above is reachable in performance mode and nothing below is reachable in patch mode.",
+                "perf_main": {
+                    "name": "Performance",
+                    "knobs": ["octave_transpose"],
+                    "params": [
+                        { "level": "perf_common", "label": "Common / Effects" },
+                        { "level": "part_selector", "label": "Edit Parts" },
+                        { "level": "save_perf_slot", "label": "Save to Slot" },
+                        { "level": "load_expansion", "label": "Load Expansion" },
+                        { "key": "octave_transpose", "label": "Octave" }
+                    ]
+                },
+                "perf_common": {
+                    "name": "Common / Effects",
+                    "_note": "The PERFORMANCE's reverb and chorus, not the patch's — in performance mode the JV-880 takes its effects from the performance, so the patch-mode Effects page is not what is sounding. Keys are sram_perfCommon_<param>; full list in the C source.",
+                    "knobs": ["sram_perfCommon_keymode", "sram_perfCommon_reverbtype", "sram_perfCommon_reverblevel", "sram_perfCommon_reverbtime", "sram_perfCommon_chorustype", "sram_perfCommon_choruslevel", "sram_perfCommon_chorusdepth", "sram_perfCommon_chorusrate"],
+                    "knob_labels": ["Key", "RvTy", "RvLv", "RvTm", "ChTy", "ChLv", "ChDp", "ChRt"]
+                },
+                "part_selector": {
+                    "name": "Parts",
+                    "child_prefix": "sram_part_", "child_count": 8, "child_label": "Part",
+                    "knobs": ["partlevel", "partpan", "reverbswitch", "chorusswitch", "partcoarsetune", "partfinetune", "internalkeyrangelower", "internalkeyrangeupper"],
+                    "knob_labels": ["Lvl", "Pan", "Rev", "Cho", "CTn", "FTn", "KLo", "KHi"]
+                },
+                "save_perf_slot": { "name": "Save to Slot", "items_param": "save_perf_slot_list", "select_param": "do_save_to_perf_slot", "navigate_to": "performance", "knobs": [] },
+                "load_expansion": { "name": "Load Expansion", "items_param": "expansion_list", "select_param": "load_expansion", "knobs": [] }
             }
         },
         "default_forward_channel": 1,
