@@ -137,4 +137,68 @@ print("  ok  performance mode reaches common / parts / save / expansion")
 PY
 
 echo
+echo "== 3. packed byte 12 against real performance data =="
+
+# The round-trip above CANNOT catch a wrong bit boundary on its own: it starts
+# from a zeroed byte and only ever compares our packer against our unpacker,
+# so any self-consistent layout passes. It did, and the layout was wrong.
+#
+# The fixture below is every distinct value of performance-common byte 12
+# across the 48 factory performances, read out of a real ROM2 + NVRAM. Real
+# data is the only thing that pins a field BOUNDARY, because a field that has
+# drifted into its neighbour still round-trips perfectly.
+python3 - "$REPO_ROOT/src/dsp/jv880_plugin.cpp" <<'PY'
+import re, sys
+
+# Distinct byte-12 values across all 48 JV-880 factory performances
+# (Preset A + Preset B from ROM2, Internal from NVRAM). Bit 5 is set in none
+# of them, which is what leaves room for reverbtype to be three bits wide.
+OBSERVED = [0x00, 0x02, 0x03, 0x04, 0x0b, 0x0c, 0x0f, 0x40, 0x41, 0x42, 0x43,
+            0x44, 0x45, 0x47, 0x4b, 0x54, 0x57, 0x80, 0x81, 0x82, 0x84, 0x87]
+
+src = open(sys.argv[1]).read()
+block = re.search(r"PERF_COMMON_PARAMS\[\]\s*=\s*\{(.*?)\n\};", src, re.S)
+if not block:
+    print("FAIL: could not find PERF_COMMON_PARAMS"); sys.exit(1)
+
+rows = re.findall(
+    r'\{"(\w+)",\s*(0x[0-9A-Fa-f]+),\s*(\d+),\s*(\d+),\s*(\d+),\s*(-?\d+),\s*(\d+)\}',
+    block.group(1))
+byte12 = [(n, int(o), int(sh), int(w), int(lo), int(hi))
+          for n, _sx, o, sh, w, lo, hi in rows if int(o) == 12]
+if len(byte12) != 3:
+    print(f"FAIL: expected 3 params packed into byte 12, found {len(byte12)}")
+    sys.exit(1)
+
+fail = []
+# Fields must not overlap, or a write to one silently corrupts the other.
+masks = {n: ((1 << w) - 1) << sh for n, _o, sh, w, _lo, _hi in byte12}
+for a in masks:
+    for b in masks:
+        if a < b and masks[a] & masks[b]:
+            fail.append(f"{a} and {b} overlap in byte 12")
+
+# Every real performance must decode inside every field's declared range.
+for b in OBSERVED:
+    for name, _off, sh, w, lo, hi in byte12:
+        v = (b >> sh) & ((1 << w) - 1)
+        if not (lo <= v <= hi):
+            fail.append(f"byte12=0x{b:02x} decodes {name}={v}, outside {lo}..{hi}")
+
+# A field that is constant across 22 distinct bytes is not being read.
+for name, _off, sh, w, _lo, _hi in byte12:
+    if len({(b >> sh) & ((1 << w) - 1) for b in OBSERVED}) == 1:
+        fail.append(f"{name} never varies across the 48 performances")
+
+if fail:
+    print("FAIL:")
+    for f in dict.fromkeys(fail):
+        print("  " + f)
+    sys.exit(1)
+print(f"  ok  {len(OBSERVED)} real byte-12 values decode in range for "
+      + ", ".join(n for n, *_ in byte12))
+print("  ok  the three fields do not overlap")
+PY
+
+echo
 echo "PASS: performance-mode parameters round-trip and the contract is well formed"
