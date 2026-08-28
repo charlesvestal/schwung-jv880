@@ -13,7 +13,10 @@ This document tracks the work needed to fully support performance editing and pa
 - Performance parameter reading (temp performance at SRAM 0x206a)
 - Performance common editing (reverb, chorus, key mode)
 - Part editing (level, pan, tune, key range, velocity, patch selection)
-- Performance saving to Internal slots (16 slots, persisted to NVRAM)
+- Performance saving to Internal slots (16 slots, persisted to NVRAM) — and
+  since `do_save_to_perf_slot`, reachable from the chain-slot UI too; before
+  that the copy existed as `write_performance_<slot>` with no level, no list
+  and no trigger in front of it
 - Expansion card selection for performances (with bank pages for >64 patches)
 - Mode-specific UI controls (track buttons, encoder macros)
 - Alphabetically sorted expansion listing
@@ -161,8 +164,22 @@ Internal performances end at 0x0d70 (0x00b0 + 16×0xCC = 0x0d70), right where te
 - [x] Add DSP handlers for reading performance common params from SRAM (`sram_perfCommon_<param>`)
 - [x] **Automated parameter mapping completed** - see SRAM Layout above
 - [x] Add DSP handlers for reading part params (level, pan, tune - working)
-- [ ] Decode packed switch bit fields (offsets 15-16)
-- [ ] Add DSP handlers for switch parameters once bit layout known
+- [x] Add DSP handlers for performance common (`sram_perfCommon_<param>`) —
+      the boxes above were ticked for the JS UI, which reaches them through
+      `state.getParam`; nothing ever supplied that, so it fell back to
+      `() => 0` and the DSP had no cases at all. Real get/set now exist and
+      the chain-slot **Common / Effects** page uses them.
+- [x] Part `internalswitch` (byte 0 bit 7) — get and set
+- [x] Part `internalvelocitysense` / `internalvelocitymax` — these were
+      SET-able and unreadable; `internalvelocitysense` was also stored raw
+      when it is centred at 64, so every value sat 64 steps out. Invisible
+      until something read it back.
+- [ ] Remaining packed switch bit fields: transmitswitch, outputselect,
+      transmitchannel (byte 0), receiveswitch / receivechannel (byte 21),
+      internalvelocitycurve (byte 15)
+- [x] `voicereserve1-8` deliberately NOT exposed: eight values that must sum
+      to 28 is not something a knob grid can express honestly, and getting it
+      wrong steals polyphony with no visible cause.
 
 ### 3. Implement Patch Saving
 **Current state:** Edits only affect temp patch at NVRAM 0x0d70. Nothing persists.
