@@ -471,9 +471,18 @@ typedef struct {
 
 static const PerfCommonParam PERF_COMMON_PARAMS[] = {
     /* name,            sysex, off, sh, w, min, max */
-    {"keymode",         0x0C,  12,  0,  2,  0,   2},
-    {"reverbtype",      0x0D,  12,  2,  3,  0,   7},
-    {"chorustype",      0x11,  12,  5,  3,  0,   2},
+    /* Byte 12 is `reverbtype(0-2) | keymode(3-4) | unused(5) | chorustype(6-7)`.
+     * The layout recorded in docs/TODO-performance-editing.md put keymode in
+     * the low bits, reverbtype at 2, and chorustype across 5-7; decoding all
+     * 48 factory performances out of ROM2/NVRAM rejects that outright —
+     * keymode reached 3 in 16 of them (three modes exist) and chorustype only
+     * ever took 0/2/4, i.e. bit 5 was never part of it. Under the layout
+     * below every one of the 48 lands in range, bit 5 is set in none of them,
+     * and reverbtype uses 7 of its 8 values. It also matches the PATCH common
+     * table above, which puts reverbtype at shift 0. */
+    {"keymode",         0x0C,  12,  3,  2,  0,   2},
+    {"reverbtype",      0x0D,  12,  0,  3,  0,   7},
+    {"chorustype",      0x11,  12,  6,  2,  0,   2},
     {"reverblevel",     0x0E,  13,  0,  7,  0, 127},
     {"reverbtime",      0x0F,  14,  0,  7,  0, 127},
     {"reverbfeedback",  0x10,  15,  0,  7,  0, 127},
