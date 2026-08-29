@@ -136,9 +136,17 @@
                         { "level": "tone1_lfo1", "label": "LFO 1" },
                         { "level": "tone1_lfo2", "label": "LFO 2" },
                         { "level": "tone1_fx", "label": "FX Sends" }
-                    ]
+                    ,
+                        { "key": "nvram_tone_0_tvaenvtime1", "short_name": "T1" },
+                        { "key": "nvram_tone_0_tvaenvtime2", "short_name": "T2" },
+                        { "key": "nvram_tone_0_tvaenvlevel3", "short_name": "L3" },
+                        { "key": "nvram_tone_0_tvaenvtime4", "short_name": "T4" }]
                 },
-                "tone1_wave":   { "name": "Wave",     "knobs": ["nvram_tone_0_cutofffrequency", "nvram_tone_0_resonance", "nvram_tone_0_tvaenvtime1", "nvram_tone_0_tvaenvtime2", "nvram_tone_0_tvaenvlevel3", "nvram_tone_0_tvaenvtime4", "nvram_tone_0_level", "nvram_tone_0_pan"], "params": [{ "key": "nvram_tone_0_toneswitch", "label": "Tone Switch" }] },
+                "tone1_wave":   { "name": "Wave",     "knobs": ["nvram_tone_0_cutofffrequency", "nvram_tone_0_resonance", "nvram_tone_0_tvaenvtime1", "nvram_tone_0_tvaenvtime2", "nvram_tone_0_tvaenvlevel3", "nvram_tone_0_tvaenvtime4", "nvram_tone_0_level", "nvram_tone_0_pan"], "params": [{ "key": "nvram_tone_0_toneswitch", "label": "Tone Switch" },
+        { "key": "nvram_tone_0_tvaenvtime1", "short_name": "T1" },
+        { "key": "nvram_tone_0_tvaenvtime2", "short_name": "T2" },
+        { "key": "nvram_tone_0_tvaenvlevel3", "short_name": "L3" },
+        { "key": "nvram_tone_0_tvaenvtime4", "short_name": "T4" }] },
                 "tone1_pitch":  { "name": "Pitch",    "_note": "explicit nvram_tone_0_* keys; see C source" },
                 "tone1_filter": { "name": "Filter",   "_note": "explicit nvram_tone_0_* keys; see C source" },
                 "tone1_amp":    { "name": "Amp",      "_note": "explicit nvram_tone_0_* keys; see C source" },
@@ -266,6 +274,7 @@
             },
             {
                 "key": "macro_tvf_env_depth",
+                "short_name": "Filter",
                 "name": "TVF Env",
                 "type": "int",
                 "min": -63,
@@ -275,6 +284,7 @@
             },
             {
                 "key": "macro_lfo_depth",
+                "short_name": "LFO",
                 "name": "LFO Depth",
                 "type": "int",
                 "min": -63,
