@@ -43,6 +43,21 @@ static void jv_debug(const char *fmt, ...) {
  * ======================================================================== */
 #define JV880_PERF_STATS 0
 
+/*
+ * Realtime priority for the emulator thread.
+ *
+ * The emulator free-runs and must keep up, so it wants SCHED_FIFO. The number
+ * matters more than the policy: Move's own Link Audio publisher, `Link Main`,
+ * runs at SCHED_FIFO **35**, and anything above that can starve it and take
+ * the whole device's audio down with it. Schwung's SPI callback is FIFO 70.
+ *
+ * 20 sits below Move's publisher and well below the SPI callback, so this
+ * thread yields to both and still preempts ordinary work. Do not raise it
+ * above 34 without measuring Link Audio dropouts -- that is precisely the
+ * regime this value exists to stay out of.
+ */
+#define JV880_EMU_RT_PRIORITY 20
+
 /* Patch data constants */
 #define PATCH_SIZE 0x16a  /* 362 bytes per patch */
 #define PATCH_NAME_LEN 12
@@ -1442,6 +1457,9 @@ static int v2_load_cache(jv880_instance_t *inst) {
 static void* v2_load_thread_func(void *arg) {
     jv880_instance_t *inst = (jv880_instance_t*)arg;
 
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "jv880-load");   /* see v2_emu_thread_func */
+#endif
     fprintf(stderr, "JV880 v2: Load thread started\n");
 
     /*
@@ -1660,33 +1678,62 @@ static void* v2_load_thread_func(void *arg) {
     inst->thread_running = 1;
     inst->initialized = 1;
     /*
-     * The emu thread keeps the scheduling it had BEFORE this thread dropped
-     * itself to SCHED_OTHER.
+     * The emu thread ASKS for a priority. It no longer takes whatever it
+     * happened to inherit.
      *
-     * It used to inherit SCHED_FIFO 90 through this thread, and that is an
-     * audio-path decision -- arguably the wrong one, since a free-running
-     * emulator at FIFO 90 is exactly what starves Move's Link Main at FIFO 35,
-     * but changing it needs listening tests and underrun counts, not a
-     * side-effect of a UI fix. So it is restored explicitly rather than
-     * silently altered.
+     * The previous version captured the policy inherited from the SPI callback
+     * and handed that to the emu thread, deliberately, so that a UI fix would
+     * not silently change an audio-path decision. That was right at the time
+     * and it is no longer sufficient, for two separate reasons:
      *
-     * If the explicit request is refused (no privilege from a SCHED_OTHER
-     * thread), fall back to a plain create: SCHED_OTHER is a degraded emu
-     * thread, not a broken one, and it is still better than not starting.
+     * 1. INHERITING IS NOW ACCIDENTAL. Schwung builds a slot's sound generator
+     *    on a normal-priority loader thread (host >= 2026-08), so
+     *    create_instance -- and therefore this thread -- is SCHED_OTHER there
+     *    and SCHED_FIFO 70 on an older host. Inheriting means the emulator's
+     *    scheduling depends on which host you happen to be running, which is
+     *    the opposite of a decision.
+     *
+     * 2. WHAT IT INHERITED WAS TOO HIGH. Measured on hardware 2026-08-22, this
+     *    thread ran at FIFO 45 while Move's own Link Audio publisher,
+     *    `Link Main`, runs at FIFO 35. A free-running emulator above the
+     *    publisher starves it, and that is a leading suspect for the Link Audio
+     *    dropouts. The old comment said as much and asked for listening tests
+     *    rather than a side effect; this is that change, made on purpose.
+     *
+     * So: SCHED_FIFO at JV880_EMU_RT_PRIORITY -- realtime, because the
+     * emulator must keep up, but BELOW 35 so it can never outrank Move's
+     * publisher. Requesting FIFO from a SCHED_OTHER thread needs privilege
+     * (CAP_SYS_NICE / RLIMIT_RTPRIO); the shim has it, but if the request is
+     * refused we fall back to a plain create, because SCHED_OTHER is a degraded
+     * emu thread and not a broken one, and it is still better than not
+     * starting.
+     *
+     * Backwards compatible: this depends on nothing the host provides, so it
+     * needs no min_host_version bump. On an old host it lowers a FIFO-45
+     * thread to 20; on a new one it raises a SCHED_OTHER thread to 20.
      */
+    (void)inherited_param;
     int emu_started = 0;
-    if (inherited_policy != SCHED_OTHER) {
+    {
         pthread_attr_t attr;
         if (pthread_attr_init(&attr) == 0) {
+            struct sched_param emu_param;
+            memset(&emu_param, 0, sizeof(emu_param));
+            emu_param.sched_priority = JV880_EMU_RT_PRIORITY;
             pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-            pthread_attr_setschedpolicy(&attr, inherited_policy);
-            pthread_attr_setschedparam(&attr, &inherited_param);
+            pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
+            pthread_attr_setschedparam(&attr, &emu_param);
             emu_started = (pthread_create(&inst->emu_thread, &attr,
                                           v2_emu_thread_func, inst) == 0);
             if (!emu_started)
-                fprintf(stderr, "JV880 v2: WARNING emu thread refused policy %d "
-                                "prio %d; falling back to inherited scheduling\n",
-                        inherited_policy, inherited_param.sched_priority);
+                fprintf(stderr, "JV880 v2: WARNING emu thread refused SCHED_FIFO %d; "
+                                "falling back to SCHED_OTHER (degraded, not broken)\n",
+                        JV880_EMU_RT_PRIORITY);
+            else if (inherited_policy != SCHED_OTHER)
+                fprintf(stderr, "JV880 v2: emu thread at SCHED_FIFO %d "
+                                "(was inheriting policy %d prio %d)\n",
+                        JV880_EMU_RT_PRIORITY, inherited_policy,
+                        inherited_param.sched_priority);
             pthread_attr_destroy(&attr);
         }
     }
@@ -1945,6 +1992,16 @@ static void v2_emu_thread_setup(void) {
 static void* v2_emu_thread_func(void *arg) {
     jv880_instance_t *inst = (jv880_instance_t*)arg;
     v2_emu_thread_setup();
+    /*
+     * NAME IT. A thread with no name inherits its parent's `comm`, so this one
+     * reported as `Audio Main/SPI` -- indistinguishable from Schwung's real SPI
+     * thread in top, in a thread list, or to us. That invisibility is why the
+     * fleet's realtime threads went unnoticed for so long, and it defeated the
+     * audit that went looking for them.
+     */
+#ifdef __linux__
+    pthread_setname_np(pthread_self(), "jv880-emu");
+#endif
     fprintf(stderr, "JV880 v2: Emulation thread started\n");
 
 #if JV880_PERF_STATS
