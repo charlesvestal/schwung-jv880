@@ -745,7 +745,15 @@ typedef struct {
     int octave_transpose;
 
     /* Deferred state restoration (applied after loading completes) */
-    char pending_state[2048];
+    /* Sized to the host's whole state payload (MAX_SYNTH_STATE_LEN). At 2048
+     * a deferred restore -- which is EVERY restore at boot, since state
+     * arrives long before the patch list is built -- was strncpy'd to 2047
+     * bytes. The core fields survived that (they lead, and the parser is a
+     * key lookup rather than a JSON parse), which is why it never showed up
+     * as the reported symptom, but the patch hex was cut mid-dump and the
+     * flat fields were lost. Restoring less than was saved is silent
+     * corruption of exactly the kind #11 is about. */
+    char pending_state[16384];
     int pending_state_valid;
 
     /* Error state */
@@ -3982,6 +3990,23 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
     }
     /* State serialization for patch save/load */
     if (strcmp(key, "state") == 0) {
+        /* REFUSE to answer while the patch list is still being built.
+         *
+         * current_patch is 0 until the deferred restore runs, so answering
+         * here hands the host a complete-looking state saying "preset":0 --
+         * and Schwung's autosave persists it, destroying the patch the user
+         * actually had. That is the half of #11 that survives even once the
+         * size problem below is fixed, because it corrupts the file rather
+         * than failing to read it.
+         *
+         * -1 is the right answer rather than an empty string: Schwung
+         * distinguishes a FAILED read (null) from "this module has no state"
+         * (""), and on a failed read buildSlotPatchJson bails and PRESERVES
+         * the existing slot_N.json. An empty string would be taken as an
+         * answer and clobber it. */
+        if (!inst->loading_complete) {
+            return -1;
+        }
         /* NOTE: link_tones is a transient editing overlay (its reversal backup
          * is not persisted), so it is intentionally NOT serialized here — the
          * state SET parser doesn't restore it, and emitting it would imply a
@@ -4019,24 +4044,68 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
          * "state" set parser looks up only named keys, so these are ignored
          * on restore; values come from this same get_param, so they always
          * match what the UI controls expect. */
+        /* THE BUDGET IS AGAINST THE SIZE SCHWUNG STORES, NOT THE SIZE WE WRITE.
+         *
+         * These flat fields are a Remote-UI convenience; the fields above are
+         * the actual save. Bounding them at ~15.8KB of OUR bytes looked safe
+         * against the host's 16KB MAX_SYNTH_STATE_LEN and was not, because the
+         * host does not store what we emit. shadow_ui.js JSON.parses this
+         * object and re-serializes the slot file with JSON.stringify(w, null,
+         * 2), so every field comes back with a newline, ten spaces of indent
+         * for its nesting depth, and a space after its colon.
+         *
+         * Measured with the real key names: 364 fields is 12,227 bytes here
+         * and 16,604 in the file -- 220 over the limit. chain_patch.c then
+         * DROPS the whole state silently (the `len < MAX_SYNTH_STATE_LEN`
+         * guard has no else), the module is never given its state, and it
+         * falls back to preset 0 -- "A.Piano 1" (#11, #8).
+         *
+         * So charge each field what it will cost IN THE FILE. The per-field
+         * overhead is a host detail we are deliberately estimating; erring
+         * high only drops a few UI-convenience fields, while erring low loses
+         * the entire save, so PRETTY_OVERHEAD is generous on purpose.
+         *
+         * Priority is deliberate: the patch hex above is authoritative
+         * persistence and is always emitted, and these best-effort fields are
+         * what gets truncated. The Remote UI can still read any missing key
+         * individually; a dropped save cannot be recovered at all. */
         if (inst->mcu && inst->loading_complete) {
-            const int SAFE = (buf_len < 15800 ? buf_len : 15800) - 64;
+            const int PRETTY_OVERHEAD = 14;   /* newline + indent + ": " per field */
+            const int HOST_STATE_LIMIT = 16384;  /* Schwung MAX_SYNTH_STATE_LEN */
+            const int MARGIN = 1024;          /* deeper nesting, longer values */
+            int projected = written + PRETTY_OVERHEAD * 12;  /* the fields above */
+            const int SAFE_PROJECTED = HOST_STATE_LIMIT - MARGIN;
+
             char tmp[48], k[48];
-            for (size_t mi = 0; mi < NUM_MACROS && written < SAFE; mi++) {
+            /* Emit while the projected FILE size still fits. */
+            for (size_t mi = 0; mi < NUM_MACROS && projected < SAFE_PROJECTED; mi++) {
                 snprintf(k, sizeof(k), "macro_%s", MACRO_DEFS[mi].key);
                 int n = v2_get_param(instance, k, tmp, sizeof(tmp));
-                if (n > 0) written += snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+                if (n > 0 && written < buf_len - 64) {
+                    int w = snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+                    written += w;
+                    projected += w + PRETTY_OVERHEAD;
+                }
             }
-            for (size_t pi = 0; pi < NUM_PATCH_COMMON_PARAMS && written < SAFE; pi++) {
+            for (size_t pi = 0; pi < NUM_PATCH_COMMON_PARAMS && projected < SAFE_PROJECTED; pi++) {
                 snprintf(k, sizeof(k), "nvram_patchCommon_%s", PATCH_COMMON_PARAMS[pi].name);
                 int n = v2_get_param(instance, k, tmp, sizeof(tmp));
-                if (n > 0) written += snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+                if (n > 0 && written < buf_len - 64) {
+                    int w = snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+                    written += w;
+                    projected += w + PRETTY_OVERHEAD;
+                }
             }
-            for (int t = 0; t < 4 && written < SAFE; t++) {
-                for (size_t ti = 0; ti < sizeof(TONE_PARAMS)/sizeof(TONE_PARAMS[0]) && written < SAFE; ti++) {
+            for (int t = 0; t < 4 && projected < SAFE_PROJECTED; t++) {
+                for (size_t ti = 0; ti < sizeof(TONE_PARAMS)/sizeof(TONE_PARAMS[0])
+                                    && projected < SAFE_PROJECTED; ti++) {
                     snprintf(k, sizeof(k), "nvram_tone_%d_%s", t, TONE_PARAMS[ti].name);
                     int n = v2_get_param(instance, k, tmp, sizeof(tmp));
-                    if (n > 0) written += snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+                    if (n > 0 && written < buf_len - 64) {
+                        int w = snprintf(buf + written, buf_len - written, ",\"%s\":%s", k, tmp);
+                        written += w;
+                        projected += w + PRETTY_OVERHEAD;
+                    }
                 }
             }
         }
