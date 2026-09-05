@@ -3002,11 +3002,30 @@ static void v2_set_param(void *instance, const char *key, const char *val) {
             inst->octave_transpose = oct;
         }
 
-        /* Restore working patch data from hex string */
+        /* Restore working patch data from hex string.
+         *
+         * The state does NOT always arrive as our own compact emission: at set
+         * load / boot, chain_patch.c hands back the raw slice of slot_N.json,
+         * which shadow_ui.js wrote with JSON.stringify(wrapper, null, 2) — so
+         * the key arrives as `"patch": "` with a space after the colon.
+         * strstr for the compact form only matched user presets (stored
+         * compact), which is why edits survived a preset load but silently
+         * vanished on every set reload while the preset number (parsed by the
+         * whitespace-tolerant json_get_number) still restored. Tolerate
+         * whitespace between the key, the colon and the opening quote. */
         if (inst->mcu) {
-            const char *patch_start = strstr(val, "\"patch\":\"");
+            const char *patch_start = NULL;
+            const char *pk = strstr(val, "\"patch\"");
+            if (pk) {
+                pk += 7;
+                while (*pk == ' ' || *pk == '\t' || *pk == '\n' || *pk == '\r') pk++;
+                if (*pk == ':') {
+                    pk++;
+                    while (*pk == ' ' || *pk == '\t' || *pk == '\n' || *pk == '\r') pk++;
+                    if (*pk == '"') patch_start = pk + 1;
+                }
+            }
             if (patch_start) {
-                patch_start += 9;  /* Skip past "patch":" */
                 const char *patch_end = strchr(patch_start, '"');
                 if (patch_end && (patch_end - patch_start) == PATCH_SIZE * 2) {
                     /* Decode hex to NVRAM */
