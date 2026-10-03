@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <pwd.h>
 #include <time.h>
+#include "big_alloc.h"
 #include <dirent.h>
 #include <errno.h>
 #include <math.h>
@@ -728,6 +729,12 @@ typedef struct {
     volatile int thread_running;
     pthread_t load_thread;
     volatile int load_thread_running;
+    /* Set when load_thread was created, cleared only by the join. The thread
+     * clears load_thread_running ITSELF when it finishes, so that flag cannot
+     * say whether a join is owed -- and an unjoined thread keeps its stack
+     * (8 MB) mapped after it exits: measured on a Move, every Mini-JV
+     * load/unload left MoveOriginal ~8 MB larger. */
+    int load_thread_started;
 
     /* Audio ring buffer */
     int16_t audio_ring[AUDIO_RING_SIZE * 2];
@@ -920,11 +927,12 @@ static int v2_scan_expansion_rom(jv880_instance_t *inst, const char *filename, E
         return 0;
     }
 
-    uint8_t *scrambled = (uint8_t *)malloc(rom_size);
-    uint8_t *unscrambled_data = (uint8_t *)malloc(rom_size);
+    /* Up to 8 MB each: mapped (big_alloc.h). */
+    uint8_t *scrambled = (uint8_t *)big_alloc(rom_size);
+    uint8_t *unscrambled_data = (uint8_t *)big_alloc(rom_size);
     if (!scrambled || !unscrambled_data) {
-        free(scrambled);
-        free(unscrambled_data);
+        big_free(scrambled, rom_size);
+        big_free(unscrambled_data, rom_size);
         fclose(f);
         return 0;
     }
@@ -933,7 +941,7 @@ static int v2_scan_expansion_rom(jv880_instance_t *inst, const char *filename, E
     fclose(f);
 
     unscramble_rom(scrambled, unscrambled_data, rom_size);
-    free(scrambled);
+    big_free(scrambled, rom_size);
 
     int patch_count = unscrambled_data[0x67] | (unscrambled_data[0x66] << 8);
     uint32_t patches_offset = unscrambled_data[0x8f] |
@@ -943,7 +951,7 @@ static int v2_scan_expansion_rom(jv880_instance_t *inst, const char *filename, E
 
     if (patch_count <= 0 || patch_count > MAX_PATCHES_PER_EXP || patches_offset >= rom_size) {
         fprintf(stderr, "JV880 v2: Invalid expansion %s\n", filename);
-        free(unscrambled_data);
+        big_free(unscrambled_data, rom_size);
         return 0;
     }
 
@@ -1128,11 +1136,11 @@ static int v2_load_expansion_data(jv880_instance_t *inst, int exp_index) {
     FILE *f = fopen(path, "rb");
     if (!f) return 0;
 
-    uint8_t *scrambled = (uint8_t *)malloc(exp->rom_size);
-    uint8_t *unscrambled_data = (uint8_t *)malloc(exp->rom_size);
+    uint8_t *scrambled = (uint8_t *)big_alloc(exp->rom_size);
+    uint8_t *unscrambled_data = (uint8_t *)big_alloc(exp->rom_size);
     if (!scrambled || !unscrambled_data) {
-        free(scrambled);
-        free(unscrambled_data);
+        big_free(scrambled, exp->rom_size);
+        big_free(unscrambled_data, exp->rom_size);
         fclose(f);
         return 0;
     }
@@ -1141,7 +1149,7 @@ static int v2_load_expansion_data(jv880_instance_t *inst, int exp_index) {
     fclose(f);
 
     unscramble_rom(scrambled, unscrambled_data, exp->rom_size);
-    free(scrambled);
+    big_free(scrambled, exp->rom_size);
 
     exp->unscrambled = unscrambled_data;
     fprintf(stderr, "JV880 v2: Loaded expansion %s on demand\n", exp->name);
@@ -1530,13 +1538,14 @@ static void* v2_load_thread_func(void *arg) {
      */
     uint8_t *rom1 = (uint8_t *)malloc(ROM1_SIZE);
     uint8_t *rom2 = (uint8_t *)malloc(ROM2_SIZE);
-    uint8_t *waverom1 = (uint8_t *)malloc(0x200000);
-    uint8_t *waverom2 = (uint8_t *)malloc(0x200000);
+    /* 2 MB each, freed right after startSC55: mapped (big_alloc.h). */
+    uint8_t *waverom1 = (uint8_t *)big_alloc(0x200000);
+    uint8_t *waverom2 = (uint8_t *)big_alloc(0x200000);
     uint8_t *nvram = (uint8_t *)malloc(NVRAM_SIZE);
 
     if (!rom1 || !rom2 || !waverom1 || !waverom2 || !nvram) {
         fprintf(stderr, "JV880 v2: Memory allocation failed\n");
-        free(rom1); free(rom2); free(waverom1); free(waverom2); free(nvram);
+        free(rom1); free(rom2); big_free(waverom1, 0x200000); big_free(waverom2, 0x200000); free(nvram);
         delete inst->mcu;
         inst->mcu = nullptr;
         /*
@@ -1578,7 +1587,7 @@ static void* v2_load_thread_func(void *arg) {
         snprintf(inst->load_error, sizeof(inst->load_error),
                  "Mini-JV: ROM files not found. Place ROM files in roms/ folder.");
         snprintf(inst->loading_status, sizeof(inst->loading_status), "ROMs not found");
-        free(rom1); free(rom2); free(waverom1); free(waverom2); free(nvram);
+        free(rom1); free(rom2); big_free(waverom1, 0x200000); big_free(waverom2, 0x200000); free(nvram);
         delete inst->mcu;
         inst->mcu = nullptr;
         inst->rom_loaded = 0;
@@ -1597,7 +1606,7 @@ static void* v2_load_thread_func(void *arg) {
     /* Keep ROM2 for internal patch access */
     inst->rom2 = rom2;
 
-    free(rom1); free(waverom1); free(waverom2); free(nvram);
+    free(rom1); big_free(waverom1, 0x200000); big_free(waverom2, 0x200000); free(nvram);
 
     inst->rom_loaded = 1;
 
@@ -1849,7 +1858,9 @@ static void* v2_create_instance(const char *module_dir, const char *json_default
      * is created from it and its priority affects audio.
      */
     inst->load_thread_running = 1;
+    inst->load_thread_started = 1;
     if (pthread_create(&inst->load_thread, NULL, v2_load_thread_func, inst) != 0) {
+        inst->load_thread_started = 0;
         /* Nothing will ever load. Say so rather than sitting at is_loading=1
          * forever -- that is the same contract the ROMs-missing path keeps. */
         fprintf(stderr, "JV880 v2: Failed to start load thread\n");
@@ -1872,10 +1883,14 @@ static void v2_destroy_instance(void *instance) {
 
     fprintf(stderr, "JV880 v2: Destroying instance\n");
 
-    /* Stop load thread */
-    if (inst->load_thread_running) {
+    /* Stop the load thread, and JOIN it whether or not it has finished:
+     * it clears load_thread_running itself on the way out, so gating the
+     * join on that flag skipped it on every normal unload and leaked the
+     * thread's 8 MB stack. */
+    if (inst->load_thread_started) {
         inst->load_thread_running = 0;
         pthread_join(inst->load_thread, NULL);
+        inst->load_thread_started = 0;
     }
 
     /* Stop emulator thread */
@@ -1915,7 +1930,7 @@ static void v2_destroy_instance(void *instance) {
     /* Free expansion data */
     for (int i = 0; i < inst->expansion_count; i++) {
         if (inst->expansions[i].unscrambled) {
-            free(inst->expansions[i].unscrambled);
+            big_free(inst->expansions[i].unscrambled, inst->expansions[i].rom_size);
             inst->expansions[i].unscrambled = nullptr;
         }
     }

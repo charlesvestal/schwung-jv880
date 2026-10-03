@@ -34,6 +34,8 @@
 #pragma once
 
 // #include "SDL.h"
+#include <stdlib.h>
+#include "big_alloc.h"
 #include "lcd.h"
 #include "mcu_opcodes.h"
 #include "pcm.h"
@@ -334,6 +336,16 @@ struct MCU {
   uint64_t probe_sleep_steps = 0;
 
   MCU();
+
+  /* ~20 MB with the wave ROMs inline: mapped directly so delete returns it
+   * to the OS (see big_alloc.h -- through malloc it stayed in a heap arena
+   * once glibc raised its mmap threshold). */
+  static void *operator new(size_t n) {
+    void *p = big_alloc(n);
+    if (!p) abort();   /* what a failed plain new does under -fno-exceptions */
+    return p;
+  }
+  static void operator delete(void *p, size_t n) { big_free(p, n); }
 
   int startSC55(const uint8_t *s_rom1, const uint8_t *s_rom2,
                 const uint8_t *s_waverom1, const uint8_t *s_waverom2,
