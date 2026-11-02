@@ -82,6 +82,13 @@ ${CROSS_PREFIX}g++ -Ofast -shared -fPIC -std=c++11 -flto \
 # Copy files to dist (use cat to avoid ExtFS deallocation issues with Docker)
 echo "Packaging..."
 cat src/module.json > dist/minijv/module.json
+# Licence texts. LICENSE is Nuked-SC55's non-commercial licence, whose terms
+# require its notice to accompany binary redistributions; libresample (BSD)
+# requires the same. Unconditional: a missing file must fail the build.
+mkdir -p dist/minijv/licenses
+cat LICENSE > dist/minijv/LICENSE
+cat licenses/Nuked-SC55-NOTICE.txt > dist/minijv/licenses/Nuked-SC55-NOTICE.txt
+cat licenses/libresample-BSD-3-Clause.txt > dist/minijv/licenses/libresample-BSD-3-Clause.txt
 [ -f src/help.json ] && cat src/help.json > dist/minijv/help.json
 cat src/ui.js > dist/minijv/ui.js
 [ -f src/web_ui.html ] && cat src/web_ui.html > dist/minijv/web_ui.html

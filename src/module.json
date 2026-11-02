@@ -5,7 +5,7 @@
     "version": "0.6.2",
     "description": "ROM-based PCM rompler emulator",
     "author": "nukeykt/giulioz (port: charlesvestal)",
-    "license": "Non-commercial",
+    "license": "Nuked-SC55 (non-commercial)",
     "ui": "ui.js",
     "dsp": "dsp.so",
     "api_version": 2,
