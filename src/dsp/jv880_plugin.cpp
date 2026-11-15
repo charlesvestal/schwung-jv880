@@ -3717,6 +3717,91 @@ static uint64_t get_time_ms(void) {
 }
 
 /* v2: Get parameter */
+/* perf_name: performance idx's name (Preset A/B from ROM2, Internal from
+ * NVRAM), trailing spaces trimmed; 0 when there is none. */
+static int perf_name(jv880_instance_t *inst, int idx, char *out) {
+    out[0] = '\0';
+    if (idx < 0 || idx >= NUM_PERFORMANCES) return 0;
+    {
+        int bank = idx / PERFS_PER_BANK;
+        int perf_in_bank = idx % PERFS_PER_BANK;
+        uint8_t name_buf[PERF_NAME_LEN + 1];
+        memset(name_buf, 0, sizeof(name_buf));
+        int got_name = 0;
+
+        if (bank == 2 && inst->mcu) {
+            /* Internal - read from NVRAM */
+            uint32_t nvram_offset = NVRAM_PERF_INTERNAL + (perf_in_bank * PERF_SIZE);
+            if (nvram_offset + PERF_NAME_LEN <= 0x8000) {
+                memcpy(name_buf, &inst->mcu->nvram[nvram_offset], PERF_NAME_LEN);
+                got_name = 1;
+            }
+        } else if (inst->rom2) {
+            /* Preset A/B - read from ROM2 */
+            uint32_t offset = (bank == 0) ? PERF_OFFSET_PRESET_A : PERF_OFFSET_PRESET_B;
+            offset += perf_in_bank * PERF_SIZE;
+            if (offset + PERF_NAME_LEN <= 0x40000) {
+                memcpy(name_buf, &inst->rom2[offset], PERF_NAME_LEN);
+                got_name = 1;
+            }
+        }
+
+        if (got_name) {
+            /* Trim trailing spaces */
+            int len = PERF_NAME_LEN;
+            while (len > 0 && (name_buf[len - 1] == ' ' || name_buf[len - 1] == 0)) len--;
+            name_buf[len] = '\0';
+            memcpy(out, name_buf, (size_t)len + 1);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* sound_name: the name of index idx in the current mode's list; 0 when
+ * there is none. */
+static int sound_name(jv880_instance_t *inst, int idx, char *out, int outsz) {
+    out[0] = '\0';
+    if (inst->performance_mode) {
+        char name[PERF_NAME_LEN + 1];
+        if (!perf_name(inst, idx, name)) return 0;
+        snprintf(out, outsz, "%s", name);
+        return 1;
+    }
+    if (idx < 0 || idx >= inst->total_patches) return 0;
+    snprintf(out, outsz, "%s", inst->patches[idx].name);
+    int len = (int)strlen(out);
+    while (len > 0 && out[len - 1] == ' ') out[--len] = '\0';
+    return 1;
+}
+
+/* sound_names_json writes the current list's names as a JSON array into buf
+ * and returns its full length (as snprintf does, so a caller whose buffer
+ * was short asks again with a bigger one). */
+static int sound_names_json(jv880_instance_t *inst, char *buf, int buf_len) {
+    int n = inst->performance_mode ? NUM_PERFORMANCES : inst->total_patches;
+    int pos = 0;
+    char name[PATCH_NAME_LEN + PERF_NAME_LEN + 2];
+#define PUT(c) do { if (pos < buf_len - 1) buf[pos] = (c); pos++; } while (0)
+    PUT('[');
+    for (int i = 0; i < n; i++) {
+        if (i) PUT(',');
+        PUT('"');
+        if (sound_name(inst, i, name, sizeof(name))) {
+            for (const char *c = name; *c; c++) {
+                char ch = *c;
+                if (ch == '"' || ch == '\\' || (unsigned char)ch < 0x20) ch = ' ';
+                PUT(ch);
+            }
+        }
+        PUT('"');
+    }
+    PUT(']');
+#undef PUT
+    if (buf_len > 0) buf[pos < buf_len ? pos : buf_len - 1] = '\0';
+    return pos;
+}
+
 static int v2_get_param(void *instance, const char *key, char *buf, int buf_len) {
     jv880_instance_t *inst = (jv880_instance_t*)instance;
     if (!inst) return -1;
@@ -3950,39 +4035,9 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             return snprintf(buf, buf_len, "%s", inst->loading_status);
         }
         if (inst->performance_mode) {
-            /* In performance mode, read name from ROM2/NVRAM */
-            int idx = inst->current_performance;
-            if (idx >= 0 && idx < NUM_PERFORMANCES) {
-                int bank = idx / PERFS_PER_BANK;
-                int perf_in_bank = idx % PERFS_PER_BANK;
-                uint8_t name_buf[PERF_NAME_LEN + 1];
-                memset(name_buf, 0, sizeof(name_buf));
-                int got_name = 0;
-
-                if (bank == 2 && inst->mcu) {
-                    /* Internal - read from NVRAM */
-                    uint32_t nvram_offset = NVRAM_PERF_INTERNAL + (perf_in_bank * PERF_SIZE);
-                    if (nvram_offset + PERF_NAME_LEN <= 0x8000) {
-                        memcpy(name_buf, &inst->mcu->nvram[nvram_offset], PERF_NAME_LEN);
-                        got_name = 1;
-                    }
-                } else if (inst->rom2) {
-                    /* Preset A/B - read from ROM2 */
-                    uint32_t offset = (bank == 0) ? PERF_OFFSET_PRESET_A : PERF_OFFSET_PRESET_B;
-                    offset += perf_in_bank * PERF_SIZE;
-                    if (offset + PERF_NAME_LEN <= 0x40000) {
-                        memcpy(name_buf, &inst->rom2[offset], PERF_NAME_LEN);
-                        got_name = 1;
-                    }
-                }
-
-                if (got_name) {
-                    /* Trim trailing spaces */
-                    int len = PERF_NAME_LEN;
-                    while (len > 0 && (name_buf[len - 1] == ' ' || name_buf[len - 1] == 0)) len--;
-                    name_buf[len] = '\0';
-                    return snprintf(buf, buf_len, "%s", name_buf);
-                }
+            char name[PERF_NAME_LEN + 1];
+            if (perf_name(inst, inst->current_performance, name)) {
+                return snprintf(buf, buf_len, "%s", name);
             }
             return snprintf(buf, buf_len, "---");
         }
@@ -3990,6 +4045,22 @@ static int v2_get_param(void *instance, const char *key, char *buf, int buf_len)
             return snprintf(buf, buf_len, "%s", inst->patches[inst->current_patch].name);
         }
         return snprintf(buf, buf_len, "Mini-JV");
+    }
+    /* Every sound's name without loading it, in Schwung's two forms (its
+     * param-pages audit: bulk first, then per index): "preset_names", a JSON
+     * array of the current mode's list, and "preset_name_<N>". A browser can
+     * then show the whole list (4133 patches with every expansion) instead of
+     * a name only for the patch it last played. No allocation: get_param
+     * runs on the SPI callback. */
+    if (strcmp(key, "preset_names") == 0) {
+        if (!inst->loading_complete) return -1;
+        return sound_names_json(inst, buf, buf_len);
+    }
+    if (strncmp(key, "preset_name_", 12) == 0 && key[12] >= '0' && key[12] <= '9') {
+        if (!inst->loading_complete) return -1;
+        char name[PATCH_NAME_LEN + PERF_NAME_LEN + 2];
+        if (!sound_name(inst, atoi(key + 12), name, sizeof(name))) return -1;
+        return snprintf(buf, buf_len, "%s", name);
     }
     if (strcmp(key, "preset_count") == 0 || strcmp(key, "total_patches") == 0) {
         return snprintf(buf, buf_len, "%d", inst->total_patches);
